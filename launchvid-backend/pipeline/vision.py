@@ -14,7 +14,7 @@ from config import GEMINI_API_KEY
 # ── Configure Gemini ───────────────────────────────────────────────────────────
 
 genai.configure(api_key=GEMINI_API_KEY)
-_model = genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
+_model = genai.GenerativeModel("gemini-2.5-flash")
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
 

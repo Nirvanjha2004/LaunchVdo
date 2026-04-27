@@ -82,7 +82,7 @@ async def analyze(payload: ExportPayload):
 
     # Create job record in Supabase
     await create_job(job_id, frame_count=len(payload.frames))
-
+    print(f"[main] Job {job_id} created — {len(payload.frames)} frames")
     # Kick off pipeline in background — don't await it
     asyncio.create_task(
         run_pipeline(job_id, payload.frames, payload.appDescription)
