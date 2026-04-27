@@ -141,6 +141,18 @@ def _build_render_props(
     scenes_clean = []
     for scene in scenes_with_audio:
         audio_path = scene.get("audio_path")
+        
+        # FIX 3: Clean path for Remotion Web URL format
+        if audio_path:
+            # 1. Backslashes (\) ko forward slashes (/) mein badlein
+            audio_path = audio_path.replace("\\", "/")
+            
+            # 2. Extra prefix hata dein taaki Remotion ke public folder se direct resolve ho
+            if "launchvid-remotion/public/" in audio_path:
+                audio_path = audio_path.split("launchvid-remotion/public/")[-1]
+            elif "public/" in audio_path:
+                audio_path = audio_path.split("public/")[-1]
+
         scenes_clean.append({
             "sceneIndex":      scene["scene_index"],
             "sceneType":       scene.get("scene_type", "screen"),
