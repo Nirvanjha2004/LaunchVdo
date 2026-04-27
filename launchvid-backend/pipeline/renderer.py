@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
+import shutil
 
 from config import OUTPUT_DIR, REMOTION_DIR
 
@@ -61,9 +62,16 @@ async def render_video(
             "Set REMOTION_DIR in .env to point to your Remotion project."
         )
 
+    npx_path = shutil.which("npx")
+    if not npx_path:
+        raise FileNotFoundError(
+            "npx not found in PATH. Make sure Node.js is installed: https://nodejs.org"
+        )
+
     cmd = [
-        "npx", "remotion", "render",
-        "LaunchVideo",          # composition ID in your Remotion project
+        npx_path,               # full path like C:\...\npx.cmd
+        "remotion", "render",
+        "LaunchVideo",
         output_path,
         "--props", props_path,
         "--log", "verbose",
@@ -75,6 +83,7 @@ async def render_video(
         cwd=remotion_dir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env={**os.environ},   # ← pass full environment so Node can find itself
     )
 
     stdout, stderr = await process.communicate()

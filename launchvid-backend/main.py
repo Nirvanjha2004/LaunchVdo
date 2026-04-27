@@ -17,6 +17,8 @@ Pipeline (runs in background after POST /analyze):
 """
 
 import asyncio
+asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 import traceback
 import uuid
 from typing import Any
