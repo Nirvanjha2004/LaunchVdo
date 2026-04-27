@@ -38,7 +38,8 @@ async def render_video(
     Returns:
         Absolute path to the rendered MP4 file
     """
-    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    # FIX 1: output_dir ko start mein hi absolute path bana diya
+    output_dir = os.path.abspath(os.path.join(OUTPUT_DIR, job_id))
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, "launch_video.mp4")
 
@@ -73,7 +74,7 @@ async def render_video(
         "remotion", "render",
         "LaunchVideo",
         output_path,
-        "--props", props_path,
+        f"--props={props_path}",  # FIX 2: Remotion ka alternative API use kiya hai
         "--log", "verbose",
     ]
 
