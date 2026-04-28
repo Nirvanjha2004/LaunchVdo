@@ -5,6 +5,7 @@ Sends each exported Figma frame (PNG + layer tree) to Gemini 2.5 Flash.
 Returns a structured animation plan for each frame.
 """
 
+import asyncio
 import base64
 import json
 import re
@@ -84,6 +85,21 @@ def _parse_json_response(text: str) -> dict:
     return json.loads(text)
 
 
+def _index_layers(layer: dict) -> dict[str, dict]:
+    """Flatten the layer tree into a lookup by layer id."""
+    lookup: dict[str, dict] = {}
+
+    def walk(node: dict) -> None:
+        node_id = node.get("id")
+        if node_id:
+            lookup[node_id] = node
+        for child in node.get("children", []) or []:
+            walk(child)
+
+    walk(layer or {})
+    return lookup
+
+
 # ── Main function ──────────────────────────────────────────────────────────────
 
 async def analyze_frame(frame: dict) -> dict:
@@ -103,6 +119,7 @@ async def analyze_frame(frame: dict) -> dict:
     png_b64       = frame.get("fullPngBase64", "")
     layers        = frame.get("layers", {})
     layer_tree_str = _truncate_layer_tree(layers)
+    layer_lookup = _index_layers(layers)
 
     prompt = FRAME_ANALYSIS_PROMPT.format(layer_tree=layer_tree_str)
 
@@ -129,6 +146,13 @@ async def analyze_frame(frame: dict) -> dict:
             result["width"]      = frame.get("width", 0)
             result["height"]     = frame.get("height", 0)
 
+            for anim in result.get("animation_sequence", []):
+                layer_meta = layer_lookup.get(anim.get("layer_id", ""), {})
+                anim["__font_size"] = layer_meta.get("text", {}).get("fontSize")
+                anim["__exported_image"] = layer_meta.get("exportedImageBase64")
+                anim["__y"] = layer_meta.get("y")
+                anim["__height"] = layer_meta.get("height")
+
             # FIX 4 applied: Apply semantic rules to animation sequence
             if "animation_sequence" in result:
                 result["animation_sequence"] = apply_semantic_rules(result["animation_sequence"])
@@ -141,7 +165,6 @@ async def analyze_frame(frame: dict) -> dict:
                 # Exponential backoff: 1s, 2s, 4s
                 delay = 2 ** attempt
                 print(f"[vision] Retrying after {delay}s...")
-                import asyncio
                 await asyncio.sleep(delay)
             else:
                 print(f"[vision] All retries failed for '{frame_name}'")
@@ -157,7 +180,6 @@ async def analyze_frame(frame: dict) -> dict:
                     # Longer delay for rate limits
                     delay = 10
                     print(f"[vision] Rate limited, retrying after {delay}s...")
-                    import asyncio
                     await asyncio.sleep(delay)
                 else:
                     print(f"[vision] Rate limit persisted after retries for '{frame_name}'")
@@ -167,7 +189,6 @@ async def analyze_frame(frame: dict) -> dict:
                 if attempt < max_attempts - 1:
                     delay = 2 ** attempt
                     print(f"[vision] Retrying after {delay}s...")
-                    import asyncio
                     await asyncio.sleep(delay)
                 else:
                     print(f"[vision] All retries failed for '{frame_name}': {e}")
@@ -208,13 +229,12 @@ def _fallback_analysis(frame: dict) -> dict:
 
 
 # FIX 4 applied: Semantic animation rules to override/refine Gemini suggestions
-def apply_semantic_rules(animation_sequence: list[dict], layers_map: dict | None = None) -> list[dict]:
+def apply_semantic_rules(animation_sequence: list[dict]) -> list[dict]:
     """
     Post-process animation sequence with deterministic semantic rules.
     
     Args:
         animation_sequence: List of animation steps from Gemini
-        layers_map: Optional map of layer_id → LayerData for accessing layer properties
     
     Returns:
         Modified animation sequence with semantic rules applied
@@ -228,84 +248,72 @@ def apply_semantic_rules(animation_sequence: list[dict], layers_map: dict | None
         name = anim.get("layer_name", "").lower()
         layer_type = anim.get("layer_type", "")
         delay_ms = anim.get("delay_ms", 0)
-        duration_ms = anim.get("duration_ms", 400)
-        easing = anim.get("easing", "ease_out")
+        font_size = anim.get("__font_size")
+        exported_image = anim.get("__exported_image")
 
-        # Rule 1: Background/rect layers → fade_in quickly
         if ("background" in name or "bg" in name or "rect" in name) and layer_type == "RECTANGLE":
             anim["animation"] = "fade_in"
             anim["delay_ms"] = 0
             anim["duration_ms"] = 300
-            result.append(anim)
-            continue
-
-        # Rule 2: Large text (title, headline, heading, header) or fontSize > 40 → slide_up with spring
-        is_title_like = any(x in name for x in ["title", "headline", "heading", "header"])
-        if layer_type == "TEXT" and is_title_like:
+            anim["easing"] = anim.get("easing", "ease_out")
+        elif layer_type == "TEXT" and (
+            any(x in name for x in ["title", "headline", "heading", "header"]) or (font_size is not None and font_size > 40)
+        ):
             anim["animation"] = "slide_up"
-            anim["easing"] = "spring"
             anim["duration_ms"] = 500
-            result.append(anim)
-            continue
-
-        # Rule 3: Button/CTA layers → scale_in with delayed start
-        if any(x in name for x in ["button", "cta", "btn"]):
+            anim["easing"] = "spring"
+        elif any(x in name for x in ["button", "cta", "btn"]):
             anim["animation"] = "scale_in"
             anim["delay_ms"] = delay_ms + 150
             anim["duration_ms"] = 400
-            result.append(anim)
-            continue
-
-        # Rule 4: Image-filled rectangles → scale_in smoothly
-        if layer_type == "RECTANGLE" and anim.get("animation") == "fade_in":
-            # Check if this might be an image (would be indicated by exportedImageBase64)
-            # For now, we apply this to any fade_in rectangle
+        elif layer_type == "RECTANGLE" and exported_image:
             anim["animation"] = "scale_in"
             anim["duration_ms"] = 600
             anim["easing"] = "ease_in_out"
-            result.append(anim)
-            continue
-
-        # Rule 5: Vector/Boolean operations → fade_in
-        if layer_type in ["VECTOR", "BOOLEAN_OPERATION"]:
+        elif layer_type in ["VECTOR", "BOOLEAN_OPERATION"]:
             anim["animation"] = "fade_in"
             anim["duration_ms"] = 400
-            result.append(anim)
-            continue
-
-        # Rule 6: Ellipse → scale_in
-        if layer_type == "ELLIPSE":
+        elif layer_type == "ELLIPSE":
             anim["animation"] = "scale_in"
             anim["duration_ms"] = 300
-            result.append(anim)
-            continue
 
         result.append(anim)
 
-    # Rule 7: Detect stagger — if 3+ layers have similar delays and y positions
-    # Group by delay (within 50ms tolerance)
-    delay_groups: dict[int, list] = {}
+    # Rule 7: Detect stagger — if 3+ layers have delay within 50ms and similar y positions
+    groups: list[list[dict]] = []
     for anim in result:
         delay = anim.get("delay_ms", 0)
-        # Find group this delay belongs to (within 50ms)
-        found_group = None
-        for group_delay in delay_groups:
-            if abs(delay - group_delay) <= 50:
-                found_group = group_delay
+        y = anim.get("__y")
+        height = anim.get("__height") or 0
+
+        matched_group = None
+        for group in groups:
+            anchor = group[0]
+            anchor_delay = anchor.get("delay_ms", 0)
+            anchor_y = anchor.get("__y")
+            anchor_height = anchor.get("__height") or 0
+            y_threshold = max(24, min(anchor_height, height) * 0.15 if anchor_height and height else 24)
+            if abs(delay - anchor_delay) <= 50 and y is not None and anchor_y is not None and abs(y - anchor_y) <= y_threshold:
+                matched_group = group
                 break
 
-        if found_group is None:
-            found_group = delay
-            delay_groups[found_group] = []
+        if matched_group is None:
+            groups.append([anim])
+        else:
+            matched_group.append(anim)
 
-        delay_groups[found_group].append(anim)
+    for group in groups:
+        if len(group) >= 3:
+            sorted_group = sorted(group, key=lambda item: (item.get("__y", 0), item.get("delay_ms", 0)))
+            base_delay = min(item.get("delay_ms", 0) for item in sorted_group)
+            for index, anim in enumerate(sorted_group):
+                anim["delay_ms"] = base_delay + (index * 80)
 
-    # Apply stagger to groups with 3+ items
-    for group_delay, group_anims in delay_groups.items():
-        if len(group_anims) >= 3:
-            # Sort by current delay, then apply stagger
-            for i, anim in enumerate(sorted(group_anims, key=lambda x: x.get("delay_ms", 0))):
-                anim["delay_ms"] = group_delay + (i * 80)
+    for anim in result:
+        anim.pop("__font_size", None)
+        anim.pop("__exported_image", None)
+        anim.pop("__y", None)
+        anim.pop("__height", None)
 
     return result
 

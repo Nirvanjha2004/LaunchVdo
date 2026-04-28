@@ -87,16 +87,9 @@ async def analyze(payload: ExportPayload):
     # Create job record in Supabase
     await create_job(job_id, frame_count=len(payload.frames))
     print(f"[main] Job {job_id} created — {len(payload.frames)} frames")
-    
-    # FIX 6 applied: Use queue system instead of bare create_task
-    # Create a coroutine for run_pipeline and enqueue it
-    async def pipeline_coro():
-        return await run_pipeline(job_id, payload.frames, payload.appDescription)
-    
-    # Kick off pipeline with queue management — don't await it
-    asyncio.create_task(
-        enqueue_job(job_id, pipeline_coro())
-    )
+
+    # FIX 6 applied: Queue jobs so only one render runs at a time
+    asyncio.create_task(enqueue_job(job_id, payload.frames, payload.appDescription))
 
     print(f"[main] Job {job_id} queued — {len(payload.frames)} frames")
     return JobResponse(job_id=job_id, status="queued")
