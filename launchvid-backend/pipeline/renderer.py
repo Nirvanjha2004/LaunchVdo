@@ -24,9 +24,11 @@ async def render_video(
     frames_analysis: list[dict],
     storyboard: dict,
     scenes_with_audio: list[dict],
-) -> str:
+) -> dict:
     """
-    Trigger Remotion render and return the output MP4 path.
+    FIX 9 applied: Render three output formats.
+    
+    Trigger Remotion render for three formats and return their paths.
 
     Args:
         job_id:             unique job identifier
@@ -36,12 +38,10 @@ async def render_video(
         scenes_with_audio:  scenes enriched with audio_path from tts.py
 
     Returns:
-        Absolute path to the rendered MP4 file
+        dict with keys: portrait_path, landscape_path, square_path
     """
-    # FIX 1: output_dir ko start mein hi absolute path bana diya
     output_dir = os.path.abspath(os.path.join(OUTPUT_DIR, job_id))
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, "launch_video.mp4")
 
     # Build the full props object that Remotion will receive
     render_props = _build_render_props(
@@ -53,9 +53,55 @@ async def render_video(
     with open(props_path, "w") as f:
         json.dump(render_props, f)
 
-    print(f"[renderer] Starting Remotion render for job {job_id}")
-    print(f"[renderer] Output: {output_path}")
+    # FIX 9 applied: Render three formats
+    formats = [
+        {"id": "LaunchVideoPortrait", "suffix": "_portrait", "width": 1080, "height": 1920},
+        {"id": "LaunchVideoLandscape", "suffix": "_landscape", "width": 1920, "height": 1080},
+        {"id": "LaunchVideoSquare", "suffix": "_square", "width": 1080, "height": 1080},
+    ]
 
+    render_paths = {}
+
+    for fmt in formats:
+        try:
+            output_path = os.path.join(output_dir, f"launch_video{fmt['suffix']}.mp4")
+            print(f"[renderer] Starting {fmt['id']} render for job {job_id}")
+            print(f"[renderer] Output: {output_path} ({fmt['width']}x{fmt['height']})")
+
+            await _run_remotion_render(
+                job_id=job_id,
+                composition_id=fmt["id"],
+                output_path=output_path,
+                props_path=props_path,
+                width=fmt["width"],
+                height=fmt["height"],
+            )
+
+            if not os.path.exists(output_path):
+                raise FileNotFoundError(f"Remotion finished but MP4 not found at {output_path}")
+
+            size_mb = os.path.getsize(output_path) / 1024 / 1024
+            print(f"[renderer] Render complete: {output_path} ({size_mb:.1f} MB)")
+            render_paths[fmt["suffix"]] = output_path
+
+        except Exception as e:
+            print(f"[renderer] Error rendering {fmt['id']}: {e}")
+            raise
+
+    return render_paths
+
+
+async def _run_remotion_render(
+    job_id: str,
+    composition_id: str,
+    output_path: str,
+    props_path: str,
+    width: int,
+    height: int,
+):
+    """
+    Execute a single Remotion render command.
+    """
     remotion_dir = os.path.abspath(REMOTION_DIR)
     if not os.path.exists(remotion_dir):
         raise FileNotFoundError(
@@ -70,36 +116,31 @@ async def render_video(
         )
 
     cmd = [
-        npx_path,               # full path like C:\...\npx.cmd
+        npx_path,
         "remotion", "render",
-        "LaunchVideo",
+        composition_id,
         output_path,
-        f"--props={props_path}",  # FIX 2: Remotion ka alternative API use kiya hai
+        f"--props={props_path}",
+        f"--width={width}",
+        f"--height={height}",
         "--log", "verbose",
     ]
 
-    # Run Remotion in a subprocess — it's a long-running Node.js process
+    # Run Remotion in a subprocess
     process = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=remotion_dir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env={**os.environ},   # ← pass full environment so Node can find itself
+        env={**os.environ},
     )
 
     stdout, stderr = await process.communicate()
 
     if process.returncode != 0:
-        error_msg = stderr.decode()[-2000:]  # last 2000 chars of error
+        error_msg = stderr.decode()[-2000:]
         print(f"[renderer] Remotion failed:\n{error_msg}")
         raise RuntimeError(f"Remotion render failed: {error_msg}")
-
-    if not os.path.exists(output_path):
-        raise FileNotFoundError(f"Remotion finished but MP4 not found at {output_path}")
-
-    size_mb = os.path.getsize(output_path) / 1024 / 1024
-    print(f"[renderer] Render complete: {output_path} ({size_mb:.1f} MB)")
-    return output_path
 
 
 def _build_render_props(

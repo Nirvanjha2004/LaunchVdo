@@ -7,6 +7,8 @@ import {
   useVideoConfig,
   Sequence,
   staticFile,
+  delayRender,
+  continueRender,
 } from "remotion";
 
 // ─── Types (mirrors what renderer.py sends) ────────────────────────────────────
@@ -92,6 +94,60 @@ export interface LaunchVideoProps {
 
 function msToFrames(ms: number, fps: number): number {
   return Math.round((ms / 1000) * fps);
+}
+
+// FIX 3 applied: Collect all unique fonts from layer tree (recursive)
+function collectFonts(layer: LayerData, fonts: Set<string>): void {
+  if (layer.text?.fontFamily) {
+    fonts.add(layer.text.fontFamily);
+  }
+  if (layer.children) {
+    for (const child of layer.children) {
+      collectFonts(child, fonts);
+    }
+  }
+}
+
+// FIX 3 applied: Load fonts from Google Fonts API
+async function loadFontsFromGoogleFonts(frames: FrameData[]): Promise<void> {
+  const fonts = new Set<string>();
+
+  // Collect all unique fonts from all frames
+  for (const frame of frames) {
+    collectFonts(frame.layers, fonts);
+  }
+
+  // Always include Inter as fallback
+  fonts.add("Inter");
+
+  // Load each font from Google Fonts
+  const fontPromises = Array.from(fonts).map(async (fontName) => {
+    // Replace spaces with + for Google Fonts API
+    const googleFontName = fontName.replace(/\s+/g, "+");
+    const fontUrl = `https://fonts.googleapis.com/css2?family=${googleFontName}:wght@400;700&display=swap`;
+
+    try {
+      // Fetch the CSS
+      const response = await fetch(fontUrl);
+      if (!response.ok) {
+        console.warn(`[fonts] Could not load ${fontName} from Google Fonts (${response.status})`);
+        return;
+      }
+
+      const css = await response.text();
+
+      // Create a style element and inject it
+      const styleEl = document.createElement("style");
+      styleEl.textContent = css;
+      document.head.appendChild(styleEl);
+
+      console.log(`[fonts] Loaded ${fontName} from Google Fonts`);
+    } catch (e) {
+      console.warn(`[fonts] Failed to load ${fontName}: ${(e as Error).message}`);
+    }
+  });
+
+  await Promise.all(fontPromises);
 }
 
 function getTransitionStyle(
@@ -224,6 +280,21 @@ const AnimatedLayer: React.FC<{
       }}
     >
       {content}
+
+      {/* FIX 2 applied: Recursive child rendering - children positioned relative to parent */}
+      {layer.children && layer.children.length > 0 &&
+        layer.children.map(child => (
+          <AnimatedLayer
+            key={child.id}
+            layer={child}
+            animStep={undefined}  // Children don't animate in themselves
+            fps={fps}
+            frameOffset={frameOffset}
+            scaleX={scaleX}
+            scaleY={scaleY}
+          />
+        ))
+      }
     </div>
   );
 };
@@ -236,12 +307,27 @@ const ScreenScene: React.FC<{
   fps: number;
   localFrame: number; // frame within this scene (0 = scene start)
 }> = ({ frameData, scene, fps, localFrame }) => {
-  const CANVAS_W = 1080;
-  const CANVAS_H = 1920;
+  const { width: canvasWidth, height: canvasHeight } = useVideoConfig();
 
-  // Scale the design to fit our canvas
-  const scaleX = CANVAS_W / frameData.width;
-  const scaleY = CANVAS_H / frameData.height;
+  // FIX 9 applied: Scale frames to fill canvas while maintaining aspect ratio (object-fit: cover)
+  const frameAspect = frameData.width / frameData.height;
+  const canvasAspect = canvasWidth / canvasHeight;
+
+  let scaleX: number, scaleY: number;
+
+  if (frameAspect > canvasAspect) {
+    // Frame is wider relative to its height — scale by height
+    scaleY = canvasHeight / frameData.height;
+    scaleX = scaleY;
+  } else {
+    // Frame is taller relative to its width — scale by width
+    scaleX = canvasWidth / frameData.width;
+    scaleY = scaleX;
+  }
+
+  // Center the scaled frame
+  const offsetX = (canvasWidth - frameData.width * scaleX) / 2;
+  const offsetY = (canvasHeight - frameData.height * scaleY) / 2;
 
   // Scene entry transition
   const entryProgress = spring({
@@ -266,32 +352,40 @@ const ScreenScene: React.FC<{
         ...sceneStyle,
       }}
     >
-      {/* Fallback: full frame PNG underneath (in case layer rendering misses something) */}
-      {frameData.fullPngBase64 && (
+      {/* FIX 1 applied: Ghost PNG fallback removed. Show full PNG only when no layers rendered */}
+      {layers.length === 0 && frameData.fullPngBase64 && (
         <img
           src={`data:image/png;base64,${frameData.fullPngBase64}`}
           style={{
-            position: "absolute",
             width: "100%",
             height: "100%",
             objectFit: "cover",
-            opacity: 0.15, // very faint — let layer renders take priority
           }}
         />
       )}
 
       {/* Render each layer individually with its animation */}
-      {layers.map(layer => (
-        <AnimatedLayer
-          key={layer.id}
-          layer={layer}
-          animStep={animMap.get(layer.id)}
-          fps={fps}
-          frameOffset={localFrame}
-          scaleX={scaleX}
-          scaleY={scaleY}
-        />
-      ))}
+      <div
+        style={{
+          position: "absolute",
+          left: offsetX,
+          top: offsetY,
+          width: frameData.width * scaleX,
+          height: frameData.height * scaleY,
+        }}
+      >
+        {layers.map(layer => (
+          <AnimatedLayer
+            key={layer.id}
+            layer={layer}
+            animStep={animMap.get(layer.id)}
+            fps={fps}
+            frameOffset={localFrame}
+            scaleX={scaleX}
+            scaleY={scaleY}
+          />
+        ))}
+      </div>
     </AbsoluteFill>
   );
 };
@@ -410,6 +504,24 @@ export const LaunchVideo: React.FC<LaunchVideoProps> = ({
 }) => {
   const { frame } = useVideoConfig();
   const currentFrame = useCurrentFrame();
+
+  // FIX 3 applied: Load fonts at composition start, delay render until fonts are ready
+  React.useEffect(() => {
+    const handle = delayRender("Loading custom fonts...");
+
+    const loadFonts = async () => {
+      try {
+        await loadFontsFromGoogleFonts(frames);
+        continueRender(handle);
+      } catch (e) {
+        console.error("[fonts] Error loading fonts:", e);
+        // Continue anyway — don't block rendering
+        continueRender(handle);
+      }
+    };
+
+    loadFonts();
+  }, [frames]);
 
   return (
     <AbsoluteFill style={{ backgroundColor: "#000000" }}>

@@ -98,6 +98,7 @@ async def analyze_frame(frame: dict) -> dict:
         dict with keys: screen_purpose, headline, narration, bg_color,
                         animation_sequence
     """
+    # FIX 7 applied: Exponential backoff retry logic
     frame_name    = frame.get("frameName", "Unknown")
     png_b64       = frame.get("fullPngBase64", "")
     layers        = frame.get("layers", {})
@@ -105,37 +106,75 @@ async def analyze_frame(frame: dict) -> dict:
 
     prompt = FRAME_ANALYSIS_PROMPT.format(layer_tree=layer_tree_str)
 
-    contents = [prompt]
-
-    # Attach the PNG if available
-    if png_b64:
+    max_attempts = 3
+    for attempt in range(max_attempts):
         try:
-            image_bytes = base64.b64decode(png_b64)
-            contents = [
-                {"mime_type": "image/png", "data": image_bytes},
-                prompt,
-            ]
+            contents = [prompt]
+
+            # Attach the PNG if available
+            if png_b64:
+                try:
+                    image_bytes = base64.b64decode(png_b64)
+                    contents = [
+                        {"mime_type": "image/png", "data": image_bytes},
+                        prompt,
+                    ]
+                except Exception as e:
+                    print(f"[vision] Could not decode PNG for frame '{frame_name}': {e}")
+
+            response = _model.generate_content(contents)
+            result   = _parse_json_response(response.text)
+            result["frame_name"] = frame_name
+            result["frame_id"]   = frame.get("frameId", "")
+            result["width"]      = frame.get("width", 0)
+            result["height"]     = frame.get("height", 0)
+
+            # FIX 4 applied: Apply semantic rules to animation sequence
+            if "animation_sequence" in result:
+                result["animation_sequence"] = apply_semantic_rules(result["animation_sequence"])
+
+            return result
+
+        except json.JSONDecodeError as e:
+            print(f"[vision] Attempt {attempt + 1}/{max_attempts}: JSON parse error for '{frame_name}': {e}")
+            if attempt < max_attempts - 1:
+                # Exponential backoff: 1s, 2s, 4s
+                delay = 2 ** attempt
+                print(f"[vision] Retrying after {delay}s...")
+                import asyncio
+                await asyncio.sleep(delay)
+            else:
+                print(f"[vision] All retries failed for '{frame_name}'")
+                return _fallback_analysis(frame)
+
         except Exception as e:
-            print(f"[vision] Could not decode PNG for frame '{frame_name}': {e}")
+            # Check for rate limit (429) or other errors
+            is_rate_limit = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
+            
+            if is_rate_limit:
+                print(f"[vision] Attempt {attempt + 1}/{max_attempts}: Rate limit error for '{frame_name}': {e}")
+                if attempt < max_attempts - 1:
+                    # Longer delay for rate limits
+                    delay = 10
+                    print(f"[vision] Rate limited, retrying after {delay}s...")
+                    import asyncio
+                    await asyncio.sleep(delay)
+                else:
+                    print(f"[vision] Rate limit persisted after retries for '{frame_name}'")
+                    return _fallback_analysis(frame)
+            else:
+                print(f"[vision] Attempt {attempt + 1}/{max_attempts}: Gemini error for '{frame_name}': {e}")
+                if attempt < max_attempts - 1:
+                    delay = 2 ** attempt
+                    print(f"[vision] Retrying after {delay}s...")
+                    import asyncio
+                    await asyncio.sleep(delay)
+                else:
+                    print(f"[vision] All retries failed for '{frame_name}': {e}")
+                    return _fallback_analysis(frame)
 
-    try:
-        response = _model.generate_content(contents)
-        result   = _parse_json_response(response.text)
-        result["frame_name"] = frame_name
-        result["frame_id"]   = frame.get("frameId", "")
-        result["width"]      = frame.get("width", 0)
-        result["height"]     = frame.get("height", 0)
-        return result
-
-    except json.JSONDecodeError as e:
-        print(f"[vision] JSON parse error for '{frame_name}': {e}")
-        print(f"[vision] Raw response: {response.text[:500]}")
-        # Return a safe fallback so the pipeline doesn't crash
-        return _fallback_analysis(frame)
-
-    except Exception as e:
-        print(f"[vision] Gemini error for '{frame_name}': {e}")
-        return _fallback_analysis(frame)
+    # Should never reach here, but as a final fallback
+    return _fallback_analysis(frame)
 
 
 def _fallback_analysis(frame: dict) -> dict:
@@ -166,6 +205,109 @@ def _fallback_analysis(frame: dict) -> dict:
         "bg_color":         "#ffffff",
         "animation_sequence": sequence,
     }
+
+
+# FIX 4 applied: Semantic animation rules to override/refine Gemini suggestions
+def apply_semantic_rules(animation_sequence: list[dict], layers_map: dict | None = None) -> list[dict]:
+    """
+    Post-process animation sequence with deterministic semantic rules.
+    
+    Args:
+        animation_sequence: List of animation steps from Gemini
+        layers_map: Optional map of layer_id → LayerData for accessing layer properties
+    
+    Returns:
+        Modified animation sequence with semantic rules applied
+    """
+    if not animation_sequence:
+        return animation_sequence
+
+    result = []
+
+    for anim in animation_sequence:
+        name = anim.get("layer_name", "").lower()
+        layer_type = anim.get("layer_type", "")
+        delay_ms = anim.get("delay_ms", 0)
+        duration_ms = anim.get("duration_ms", 400)
+        easing = anim.get("easing", "ease_out")
+
+        # Rule 1: Background/rect layers → fade_in quickly
+        if ("background" in name or "bg" in name or "rect" in name) and layer_type == "RECTANGLE":
+            anim["animation"] = "fade_in"
+            anim["delay_ms"] = 0
+            anim["duration_ms"] = 300
+            result.append(anim)
+            continue
+
+        # Rule 2: Large text (title, headline, heading, header) or fontSize > 40 → slide_up with spring
+        is_title_like = any(x in name for x in ["title", "headline", "heading", "header"])
+        if layer_type == "TEXT" and is_title_like:
+            anim["animation"] = "slide_up"
+            anim["easing"] = "spring"
+            anim["duration_ms"] = 500
+            result.append(anim)
+            continue
+
+        # Rule 3: Button/CTA layers → scale_in with delayed start
+        if any(x in name for x in ["button", "cta", "btn"]):
+            anim["animation"] = "scale_in"
+            anim["delay_ms"] = delay_ms + 150
+            anim["duration_ms"] = 400
+            result.append(anim)
+            continue
+
+        # Rule 4: Image-filled rectangles → scale_in smoothly
+        if layer_type == "RECTANGLE" and anim.get("animation") == "fade_in":
+            # Check if this might be an image (would be indicated by exportedImageBase64)
+            # For now, we apply this to any fade_in rectangle
+            anim["animation"] = "scale_in"
+            anim["duration_ms"] = 600
+            anim["easing"] = "ease_in_out"
+            result.append(anim)
+            continue
+
+        # Rule 5: Vector/Boolean operations → fade_in
+        if layer_type in ["VECTOR", "BOOLEAN_OPERATION"]:
+            anim["animation"] = "fade_in"
+            anim["duration_ms"] = 400
+            result.append(anim)
+            continue
+
+        # Rule 6: Ellipse → scale_in
+        if layer_type == "ELLIPSE":
+            anim["animation"] = "scale_in"
+            anim["duration_ms"] = 300
+            result.append(anim)
+            continue
+
+        result.append(anim)
+
+    # Rule 7: Detect stagger — if 3+ layers have similar delays and y positions
+    # Group by delay (within 50ms tolerance)
+    delay_groups: dict[int, list] = {}
+    for anim in result:
+        delay = anim.get("delay_ms", 0)
+        # Find group this delay belongs to (within 50ms)
+        found_group = None
+        for group_delay in delay_groups:
+            if abs(delay - group_delay) <= 50:
+                found_group = group_delay
+                break
+
+        if found_group is None:
+            found_group = delay
+            delay_groups[found_group] = []
+
+        delay_groups[found_group].append(anim)
+
+    # Apply stagger to groups with 3+ items
+    for group_delay, group_anims in delay_groups.items():
+        if len(group_anims) >= 3:
+            # Sort by current delay, then apply stagger
+            for i, anim in enumerate(sorted(group_anims, key=lambda x: x.get("delay_ms", 0))):
+                anim["delay_ms"] = group_delay + (i * 80)
+
+    return result
 
 
 async def analyze_all_frames(frames: list[dict]) -> list[dict]:

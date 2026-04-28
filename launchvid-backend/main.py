@@ -34,6 +34,7 @@ from pipeline.vision import analyze_all_frames
 from pipeline.storyboard import generate_storyboard
 from pipeline.tts import generate_all_voiceovers
 from pipeline.renderer import render_video
+from pipeline.queue import enqueue_job  # FIX 6 applied
 
 # ── App setup ──────────────────────────────────────────────────────────────────
 
@@ -59,10 +60,11 @@ class ExportPayload(BaseModel):
 
 
 class JobResponse(BaseModel):
-    job_id:    str
-    status:    str
-    video_url: str | None = None
-    error:     str | None = None
+    job_id:     str
+    status:     str
+    video_url:  str | None = None  # Backward compatibility (primary portrait)
+    video_urls: dict | None = None  # FIX 9 applied: All three formats
+    error:      str | None = None
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
@@ -85,12 +87,18 @@ async def analyze(payload: ExportPayload):
     # Create job record in Supabase
     await create_job(job_id, frame_count=len(payload.frames))
     print(f"[main] Job {job_id} created — {len(payload.frames)} frames")
-    # Kick off pipeline in background — don't await it
+    
+    # FIX 6 applied: Use queue system instead of bare create_task
+    # Create a coroutine for run_pipeline and enqueue it
+    async def pipeline_coro():
+        return await run_pipeline(job_id, payload.frames, payload.appDescription)
+    
+    # Kick off pipeline with queue management — don't await it
     asyncio.create_task(
-        run_pipeline(job_id, payload.frames, payload.appDescription)
+        enqueue_job(job_id, pipeline_coro())
     )
 
-    print(f"[main] Job {job_id} created — {len(payload.frames)} frames")
+    print(f"[main] Job {job_id} queued — {len(payload.frames)} frames")
     return JobResponse(job_id=job_id, status="queued")
 
 
@@ -102,10 +110,11 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     return JobResponse(
-        job_id=    job_id,
-        status=    job["status"],
-        video_url= job.get("video_url"),
-        error=     job.get("error"),
+        job_id=      job_id,
+        status=      job["status"],
+        video_url=   job.get("video_url"),
+        video_urls=  job.get("video_urls"),  # FIX 9 applied
+        error=       job.get("error"),
     )
 
 # ── Pipeline orchestrator ──────────────────────────────────────────────────────
@@ -137,7 +146,7 @@ async def run_pipeline(job_id: str, frames: list[dict], app_description: str):
         # ── Stage 4: Remotion render ─────────────────────────────────────────
         await update_job(job_id, status="rendering")
         print(f"[pipeline:{job_id}] Stage 4/4 — Rendering video with Remotion")
-        mp4_path = await render_video(
+        render_paths = await render_video(  # FIX 9 applied: Returns dict with three formats
             job_id=job_id,
             frames=frames,
             frames_analysis=frames_analysis,
@@ -147,10 +156,17 @@ async def run_pipeline(job_id: str, frames: list[dict], app_description: str):
 
         # ── Upload + finish ───────────────────────────────────────────────────
         print(f"[pipeline:{job_id}] Uploading to Supabase Storage")
-        video_url = await upload_video(job_id, mp4_path)
+        video_urls = await upload_video(job_id, render_paths)  # FIX 9 applied: Returns dict
 
-        await update_job(job_id, status="done", video_url=video_url)
-        print(f"[pipeline:{job_id}] ✅ Done — {video_url}")
+        # FIX 9 applied: Store all three URLs, use portrait as primary
+        primary_url = video_urls.get("portrait", "")
+        await update_job(
+            job_id,
+            status="done",
+            video_url=primary_url,  # For backward compatibility
+            video_urls=video_urls,   # All three formats
+        )
+        print(f"[pipeline:{job_id}] ✅ Done — {primary_url}")
 
     except Exception as e:
         error_detail = traceback.format_exc()

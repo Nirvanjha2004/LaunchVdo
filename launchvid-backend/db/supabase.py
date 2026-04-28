@@ -1,5 +1,5 @@
 from supabase import create_client, Client
-from config import SUPABASE_URL, SUPABASE_KEY
+from config import SUPABASE_URL, SUPABASE_KEY, OUTPUT_DIR
 from datetime import datetime
 from typing import Optional
 
@@ -26,6 +26,7 @@ def get_client() -> Client:
 #   status       text not null default 'queued',
 #   frame_count  int,
 #   video_url    text,
+#   video_urls   jsonb,
 #   error        text,
 #   created_at   timestamptz default now(),
 #   updated_at   timestamptz default now()
@@ -59,17 +60,67 @@ async def get_job(job_id: str) -> Optional[dict]:
     return result.data if result else None
 
 
-async def upload_video(job_id: str, file_path: str) -> str:
-    """Upload MP4 to Supabase Storage and return public URL."""
+async def upload_video(job_id: str, video_paths: dict) -> dict:
+    """
+    FIX 9 applied: Upload multiple video formats to Supabase Storage.
+    
+    Args:
+        job_id: Job identifier
+        video_paths: dict with keys 'portrait', 'landscape', 'square' containing file paths
+    
+    Returns:
+        dict with keys 'portrait', 'landscape', 'square' containing public URLs
+    """
     db = get_client()
-    storage_path = f"videos/{job_id}.mp4"
+    public_urls = {}
 
-    with open(file_path, "rb") as f:
-        db.storage.from_("launchvid-outputs").upload(
-            path=storage_path,
-            file=f,
-            file_options={"content-type": "video/mp4"},
-        )
+    # Upload each format
+    for suffix, file_path in video_paths.items():
+        if not file_path:
+            continue
 
-    public_url = db.storage.from_("launchvid-outputs").get_public_url(storage_path)
-    return public_url
+        storage_path = f"videos/{job_id}_{suffix}.mp4"
+
+        try:
+            with open(file_path, "rb") as f:
+                db.storage.from_("launchvid-outputs").upload(
+                    path=storage_path,
+                    file=f,
+                    file_options={"content-type": "video/mp4"},
+                )
+
+            public_url = db.storage.from_("launchvid-outputs").get_public_url(storage_path)
+            public_urls[suffix] = public_url
+            print(f"[supabase] Uploaded {suffix} video: {storage_path}")
+        except Exception as e:
+            print(f"[supabase] Failed to upload {suffix} video: {e}")
+            raise
+
+    # FIX 8 applied: Clean up temp files after successful uploads
+    try:
+        import os
+        import shutil
+
+        for suffix, file_path in video_paths.items():
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"[supabase] Deleted {suffix} MP4: {file_path}")
+
+        # Delete the audio directory
+        audio_dir = os.path.join(OUTPUT_DIR, job_id, "audio")
+        if os.path.exists(audio_dir):
+            shutil.rmtree(audio_dir)
+            print(f"[supabase] Deleted audio directory: {audio_dir}")
+
+        # Delete render_props.json
+        render_props_path = os.path.join(OUTPUT_DIR, job_id, "render_props.json")
+        if os.path.exists(render_props_path):
+            os.remove(render_props_path)
+            print(f"[supabase] Deleted render_props.json: {render_props_path}")
+
+        print(f"[supabase] Cleanup complete for job {job_id}")
+    except Exception as e:
+        print(f"[supabase] Warning: Cleanup failed for job {job_id}: {e}")
+        # Don't fail the upload if cleanup fails
+
+    return public_urls

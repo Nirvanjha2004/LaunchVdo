@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Oxygen", "Ubuntu", "Cantarell", "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
+      background: #f6f6f6;
+      padding: 20px;
+      color: #1f2937;
+    }
+
+    .container {
+      max-width: 350px;
+    }
+
+    h1 {
+      font-size: 24px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #000;
+    }
+
+    p {
+      font-size: 14px;
+      line-height: 1.5;
+      margin-bottom: 12px;
+      color: #666;
+    }
+
+    button {
+      background: #0066cc;
+      color: white;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      margin-top: 12px;
+      width: 100%;
+      transition: background 0.2s;
+    }
+
+    button:hover {
+      background: #0052a3;
+    }
+
+    button:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+
+    .status {
+      margin-top: 16px;
+      padding: 12px;
+      background: white;
+      border-radius: 6px;
+      font-size: 13px;
+      min-height: 40px;
+      display: flex;
+      align-items: center;
+    }
+
+    .status.loading {
+      color: #0066cc;
+      font-weight: 500;
+    }
+
+    .status.success {
+      color: #10b981;
+      background: #ecfdf5;
+    }
+
+    .status.error {
+      color: #dc2626;
+      background: #fef2f2;
+    }
+
+    .error-details {
+      margin-top: 12px;
+      padding: 10px;
+      background: #fef2f2;
+      border-left: 3px solid #dc2626;
+      border-radius: 4px;
+      font-size: 13px;
+      color: #7f1d1d;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .button-group button {
+      flex: 1;
+      margin-top: 0;
+    }
+
+    .button-group button.secondary {
+      background: #e5e7eb;
+      color: #1f2937;
+    }
+
+    .button-group button.secondary:hover {
+      background: #d1d5db;
+    }
+
+    .job-id {
+      font-family: monospace;
+      background: #f3f4f6;
+      padding: 8px;
+      border-radius: 4px;
+      margin: 8px 0;
+      word-break: break-all;
+      user-select: all;
+    }
+
+    .icon {
+      display: inline-block;
+      margin-right: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>📹 LaunchVid</h1>
+    <p>Export your Figma frames to generate an animated app launch video.</p>
+
+    <p><strong>Instructions:</strong></p>
+    <ol style="font-size: 13px; margin-left: 16px; margin-bottom: 12px;">
+      <li style="margin-bottom: 6px;">Select one or more frames from your Figma file</li>
+      <li style="margin-bottom: 6px;">Click "Export to LaunchVid"</li>
+      <li style="margin-bottom: 6px;">Your job will be processed by our backend</li>
+      <li>Check your email for the download link</li>
+    </ol>
+
+    <button id="exportBtn" onclick="handleExport()">
+      📤 Export to LaunchVid
+    </button>
+
+    <div class="status" id="status" style="display: none;">
+      <span id="statusText">Ready</span>
+    </div>
+
+    <!-- FIX 10 applied: Error details section with job ID copy button -->
+    <div id="errorDetails" class="error-details" style="display: none;">
+      <div><strong>Error:</strong></div>
+      <div id="errorMessage" style="margin-top: 6px;"></div>
+      <div id="jobIdSection" style="display: none; margin-top: 8px;">
+        <div style="font-size: 11px; color: #9ca3af; margin-bottom: 4px;">Job ID (for support):</div>
+        <div class="job-id" id="jobIdDisplay"></div>
+        <button class="secondary" onclick="copyJobId()" style="font-size: 12px; padding: 6px 8px; margin-top: 6px;">
+          📋 Copy Job ID
+        </button>
+      </div>
+    </div>
+
+    <!-- Retry button for failed jobs -->
+    <div id="retrySection" style="display: none; margin-top: 12px;">
+      <button class="secondary" onclick="handleExport()" style="margin-top: 0;">
+        🔄 Try Again
+      </button>
+    </div>
+  </div>
+
+  <script>
+    const BACKEND_URL = "http://localhost:8000"; // Change in production
+
+    let lastJobId = null;
+    let selectedFrames = [];
+
+    // Message handler from plugin code
+    parent.postMessage({ pluginMessage: { type: "ready" } }, "*");
+
+    function handleExport() {
+      selectedFrames = figma.currentPage.selection.filter(n => n.type === "FRAME");
+
+      if (selectedFrames.length === 0) {
+        showError(
+          "Please select at least one screen before exporting",
+          null,
+          400
+        );
+        return;
+      }
+
+      showStatus("Preparing export...", "loading");
+      parent.postMessage({ pluginMessage: { type: "export" } }, "*");
+    }
+
+    window.onmessage = async (event) => {
+      const message = event.data.pluginMessage;
+      if (!message) return;
+
+      if (message.type === "export-done") {
+        const frames = message.frames;
+        await uploadToBackend(frames);
+      }
+    };
+
+    async function uploadToBackend(frames) {
+      try {
+        showStatus("Uploading to LaunchVid backend...", "loading");
+
+        const payload = {
+          frames: frames,
+          appDescription: "Exported from Figma design",
+          exportedAt: new Date().toISOString(),
+        };
+
+        const response = await fetch(`${BACKEND_URL}/analyze`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          // FIX 10 applied: Specific error messages for known HTTP statuses
+          const statusCode = response.status;
+          let userMessage = "";
+
+          if (statusCode === 400) {
+            userMessage = "Please select at least one screen before exporting";
+          } else if (statusCode === 422) {
+            userMessage = "The export data format is invalid. Try re-running the plugin";
+          } else if (statusCode === 500) {
+            userMessage = `Something went wrong on our end. Your job ID is ${data.job_id || "unknown"} — try again in a few minutes`;
+            lastJobId = data.job_id;
+          } else {
+            userMessage = data.detail || `Server error (${statusCode})`;
+          }
+
+          showError(userMessage, data.job_id, statusCode);
+          return;
+        }
+
+        lastJobId = data.job_id;
+        showStatus(
+          `✅ Export queued! Job ID: ${data.job_id}. Check your email for download link.`,
+          "success"
+        );
+
+        // Hide retry button on success
+        document.getElementById("retrySection").style.display = "none";
+      } catch (error) {
+        // FIX 10 applied: Network error message
+        showError(
+          `Could not reach the LaunchVid server. Check that your backend is running at ${BACKEND_URL}`,
+          null,
+          0
+        );
+      }
+    }
+
+    function showStatus(message, type = "info") {
+      const statusEl = document.getElementById("status");
+      const statusText = document.getElementById("statusText");
+
+      statusEl.className = `status ${type}`;
+      statusText.textContent = message;
+      statusEl.style.display = "flex";
+
+      document.getElementById("errorDetails").style.display = "none";
+      document.getElementById("retrySection").style.display = "none";
+    }
+
+    // FIX 10 applied: Better error messages with job ID and retry button
+    function showError(message, jobId, statusCode) {
+      const statusEl = document.getElementById("status");
+      const statusText = document.getElementById("statusText");
+      const errorDetails = document.getElementById("errorDetails");
+      const errorMessage = document.getElementById("errorMessage");
+      const jobIdSection = document.getElementById("jobIdSection");
+      const retrySection = document.getElementById("retrySection");
+
+      statusEl.className = "status error";
+      statusText.textContent = "❌ Export failed";
+      statusEl.style.display = "flex";
+
+      errorMessage.textContent = message;
+      errorDetails.style.display = "block";
+
+      if (jobId) {
+        lastJobId = jobId;
+        document.getElementById("jobIdDisplay").textContent = jobId;
+        jobIdSection.style.display = "block";
+      } else {
+        jobIdSection.style.display = "none";
+      }
+
+      retrySection.style.display = "block";
+    }
+
+    function copyJobId() {
+      if (!lastJobId) return;
+
+      const el = document.getElementById("jobIdDisplay");
+      const text = el.textContent;
+
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = event.target;
+        const originalText = btn.textContent;
+        btn.textContent = "✅ Copied!";
+        setTimeout(() => {
+          btn.textContent = originalText;
+        }, 2000);
+      });
+    }
+
+    // Also expose copyJobId globally for inline onclick
+    window.copyJobId = copyJobId;
+    window.handleExport = handleExport;
+  </script>
+</body>
+</html>
