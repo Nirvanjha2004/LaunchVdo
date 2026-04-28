@@ -1,6 +1,7 @@
 import {
   AbsoluteFill,
   Audio,
+  Img,
   interpolate,
   spring,
   useCurrentFrame,
@@ -10,6 +11,22 @@ import {
   delayRender,
   continueRender,
 } from "remotion";
+import { useEffect, type CSSProperties, type FC, type ReactNode } from "react";
+
+declare const fetch: (input: string) => Promise<{
+  ok: boolean;
+  status: number;
+  text(): Promise<string>;
+}>;
+declare const document: {
+  createElement(tagName: string): { textContent: string | null };
+  head: { appendChild(node: { textContent: string | null }): void };
+};
+declare const console: {
+  log(...args: unknown[]): void;
+  warn(...args: unknown[]): void;
+  error(...args: unknown[]): void;
+};
 
 // ─── Types (mirrors what renderer.py sends) ────────────────────────────────────
 
@@ -153,7 +170,7 @@ async function loadFontsFromGoogleFonts(frames: FrameData[]): Promise<void> {
 function getTransitionStyle(
   type: string,
   progress: number
-): React.CSSProperties {
+): CSSProperties {
   switch (type) {
     case "slide_up":
       return { transform: `translateY(${interpolate(progress, [0, 1], [80, 0])}px)`, opacity: progress };
@@ -173,7 +190,7 @@ function getTransitionStyle(
 
 // ─── Single animated layer ─────────────────────────────────────────────────────
 
-const AnimatedLayer: React.FC<{
+const AnimatedLayer: FC<{
   layer: LayerData;
   animStep: AnimationStep | undefined;
   fps: number;
@@ -194,19 +211,20 @@ const AnimatedLayer: React.FC<{
 
   const animationType = animStep?.animation ?? "fade_in";
   const transitionStyle = getTransitionStyle(animationType, progress);
+  const transitionOpacity = typeof transitionStyle.opacity === "number" ? transitionStyle.opacity : 1;
 
   // pulse effect for CTA buttons
   const pulseScale = animationType === "pulse"
     ? 1 + 0.04 * Math.sin((frameOffset - delayFrames) * 0.3)
     : 1;
 
-  const positionStyle: React.CSSProperties = {
+  const positionStyle: CSSProperties = {
     position: "absolute",
     left:   layer.x * scaleX,
     top:    layer.y * scaleY,
     width:  layer.width * scaleX,
     height: layer.height * scaleY,
-    opacity: (layer.opacity ?? 1) * (transitionStyle.opacity ?? 1),
+    opacity: (layer.opacity ?? 1) * transitionOpacity,
     borderRadius: layer.cornerRadius * Math.min(scaleX, scaleY),
     transform: `${transitionStyle.transform ?? ""} scale(${pulseScale})`,
     overflow: "hidden",
@@ -229,20 +247,17 @@ const AnimatedLayer: React.FC<{
     : undefined;
 
   // ── Content ──
-  let content: React.ReactNode = null;
+  let content: ReactNode = null;
 
   if (layer.exportedSvg) {
     // Vector node exported as SVG
     content = (
-      <div
-        style={{ width: "100%", height: "100%" }}
-        dangerouslySetInnerHTML={{ __html: layer.exportedSvg }}
-      />
+      <div style={{ width: "100%", height: "100%" }} dangerouslySetInnerHTML={{ __html: layer.exportedSvg }} />
     );
   } else if (layer.exportedImageBase64) {
     // Image fill or rasterized vector/boolean op
     content = (
-      <img
+      <Img
         src={`data:image/png;base64,${layer.exportedImageBase64}`}
         style={{ width: "100%", height: "100%", objectFit: "cover" }}
       />
@@ -257,7 +272,7 @@ const AnimatedLayer: React.FC<{
           fontSize:       t.fontSize * Math.min(scaleX, scaleY),
           fontWeight:     t.fontWeight,
           fontFamily:     `"${t.fontFamily}", Inter, sans-serif`,
-          textAlign:      t.textAlign.toLowerCase() as React.CSSProperties["textAlign"],
+          textAlign:      t.textAlign.toLowerCase() as CSSProperties["textAlign"],
           lineHeight:     lh,
           letterSpacing:  t.letterSpacing,
           whiteSpace:     "pre-wrap",
@@ -354,7 +369,7 @@ const ScreenScene: React.FC<{
     >
       {/* FIX 1 applied: Ghost PNG fallback removed. Show full PNG only when no layers rendered */}
       {layers.length === 0 && frameData.fullPngBase64 && (
-        <img
+        <Img
           src={`data:image/png;base64,${frameData.fullPngBase64}`}
           style={{
             width: "100%",
@@ -495,18 +510,17 @@ const OutroCard: React.FC<{
 
 // ─── Main composition ──────────────────────────────────────────────────────────
 
-export const LaunchVideo: React.FC<LaunchVideoProps> = ({
+export const LaunchVideo: FC<LaunchVideoProps> = ({
   appName,
   tagline,
   fps,
   scenes,
   frames,
 }) => {
-  const { frame } = useVideoConfig();
   const currentFrame = useCurrentFrame();
 
   // FIX 3 applied: Load fonts at composition start, delay render until fonts are ready
-  React.useEffect(() => {
+  useEffect(() => {
     const handle = delayRender("Loading custom fonts...");
 
     const loadFonts = async () => {
