@@ -4,8 +4,8 @@
 
 ### 1.1 Precision Element Extraction
 - [x] 1.1.1 Rewrite Gemini vision prompt for precise element positioning
-- [-] 1.1.2 Implement pixel-perfect coordinate extraction with ±1px accuracy
-- [~] 1.1.3 Add layer tree traversal with depth-first element collection
+- [x] 1.1.2 Implement pixel-perfect coordinate extraction with ±1px accuracy
+- [-] 1.1.3 Add layer tree traversal with depth-first element collection
 - [~] 1.1.4 Create element bounds calculation with proper scaling
 - [~] 1.1.5 Implement element overlap detection and z-index analysis
 - [~] 1.1.6 Add element grouping detection for related UI components

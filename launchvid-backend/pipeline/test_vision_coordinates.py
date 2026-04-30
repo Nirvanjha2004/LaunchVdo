@@ -1,6 +1,6 @@
 """
-Unit tests for extract_precise_coordinates() and validate_element_coordinates()
-in pipeline/vision.py.
+Unit tests for extract_precise_coordinates(), validate_element_coordinates(),
+and collect_layers_depth_first() in pipeline/vision.py.
 
 Run with:
     python -m pytest pipeline/test_vision_coordinates.py -v
@@ -18,7 +18,12 @@ import unittest.mock as mock
 with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
     with mock.patch("google.generativeai.configure"):
         with mock.patch("google.generativeai.GenerativeModel"):
-            from pipeline.vision import extract_precise_coordinates, validate_element_coordinates
+            from pipeline.vision import (
+                extract_precise_coordinates,
+                validate_element_coordinates,
+                collect_layers_depth_first,
+                _truncate_layer_tree,
+            )
 
 
 # ── extract_precise_coordinates ───────────────────────────────────────────────
@@ -246,3 +251,307 @@ class TestValidateElementCoordinates:
         element = {"x": 0, "y": self.FRAME_H - 10, "width": 50, "height": 10}
         result = validate_element_coordinates(element, self.FRAME_W, self.FRAME_H)
         assert result["y"] + result["height"] <= self.FRAME_H
+
+
+# ── collect_layers_depth_first ────────────────────────────────────────────────
+
+class TestCollectLayersDepthFirst:
+    """Tests for collect_layers_depth_first()."""
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_layer(id: str, name: str = "", children: list | None = None,
+                    visible: bool = True, **kwargs) -> dict:
+        """Build a minimal Figma-like layer dict."""
+        node: dict = {"id": id, "name": name or id, "visible": visible}
+        node.update(kwargs)
+        if children is not None:
+            node["children"] = children
+        return node
+
+    # ── Basic traversal ───────────────────────────────────────────────────────
+
+    def test_single_root_no_children(self):
+        """A root with no children returns a single-element list."""
+        root = self._make_layer("root")
+        result = collect_layers_depth_first(root)
+        assert len(result) == 1
+        assert result[0]["id"] == "root"
+
+    def test_dfs_pre_order(self):
+        """Parent is collected before its children (pre-order DFS)."""
+        root = self._make_layer("A", children=[
+            self._make_layer("B", children=[
+                self._make_layer("D"),
+            ]),
+            self._make_layer("C"),
+        ])
+        result = collect_layers_depth_first(root)
+        ids = [n["id"] for n in result]
+        assert ids == ["A", "B", "D", "C"]
+
+    def test_z_order_sequential(self):
+        """z_order values are sequential integers starting at 0."""
+        root = self._make_layer("A", children=[
+            self._make_layer("B"),
+            self._make_layer("C"),
+        ])
+        result = collect_layers_depth_first(root)
+        z_orders = [n["z_order"] for n in result]
+        assert z_orders == list(range(len(result)))
+
+    def test_depth_field_root_is_zero(self):
+        """Root node has depth == 0."""
+        root = self._make_layer("root")
+        result = collect_layers_depth_first(root)
+        assert result[0]["depth"] == 0
+
+    def test_depth_field_children(self):
+        """Children have depth == 1, grandchildren depth == 2."""
+        root = self._make_layer("A", children=[
+            self._make_layer("B", children=[
+                self._make_layer("C"),
+            ]),
+        ])
+        result = collect_layers_depth_first(root)
+        depth_map = {n["id"]: n["depth"] for n in result}
+        assert depth_map["A"] == 0
+        assert depth_map["B"] == 1
+        assert depth_map["C"] == 2
+
+    # ── Invisible layer skipping ──────────────────────────────────────────────
+
+    def test_invisible_root_skipped(self):
+        """An invisible root node is not collected."""
+        root = self._make_layer("root", visible=False)
+        result = collect_layers_depth_first(root)
+        assert result == []
+
+    def test_invisible_child_skipped(self):
+        """An invisible child (and its subtree) is not collected."""
+        root = self._make_layer("A", children=[
+            self._make_layer("B", visible=False, children=[
+                self._make_layer("C"),  # should also be skipped
+            ]),
+            self._make_layer("D"),
+        ])
+        result = collect_layers_depth_first(root)
+        ids = [n["id"] for n in result]
+        assert "B" not in ids
+        assert "C" not in ids
+        assert "A" in ids
+        assert "D" in ids
+
+    def test_visible_true_is_collected(self):
+        """Nodes with visible == True are collected normally."""
+        root = self._make_layer("root", visible=True)
+        result = collect_layers_depth_first(root)
+        assert len(result) == 1
+
+    def test_visible_missing_is_collected(self):
+        """Nodes without a 'visible' key are treated as visible."""
+        root = {"id": "root", "name": "root"}  # no 'visible' key
+        result = collect_layers_depth_first(root)
+        assert len(result) == 1
+
+    # ── max_depth ─────────────────────────────────────────────────────────────
+
+    def test_max_depth_zero_collects_only_root(self):
+        """max_depth=0 collects only the root node."""
+        root = self._make_layer("A", children=[
+            self._make_layer("B"),
+        ])
+        result = collect_layers_depth_first(root, max_depth=0)
+        assert len(result) == 1
+        assert result[0]["id"] == "A"
+
+    def test_max_depth_one_collects_root_and_direct_children(self):
+        """max_depth=1 collects root and its direct children only."""
+        root = self._make_layer("A", children=[
+            self._make_layer("B", children=[
+                self._make_layer("C"),  # depth 2 — should be excluded
+            ]),
+        ])
+        result = collect_layers_depth_first(root, max_depth=1)
+        ids = [n["id"] for n in result]
+        assert "A" in ids
+        assert "B" in ids
+        assert "C" not in ids
+
+    def test_max_depth_default_handles_deep_tree(self):
+        """Default max_depth=10 handles trees up to 10 levels deep."""
+        # Build a chain 10 levels deep
+        node = self._make_layer("leaf")
+        for i in range(9, -1, -1):
+            node = self._make_layer(f"level_{i}", children=[node])
+        result = collect_layers_depth_first(node)
+        # root (depth 0) + 10 descendants = 11 nodes
+        assert len(result) == 11
+
+    def test_max_depth_exceeded_nodes_excluded(self):
+        """Nodes beyond max_depth are excluded."""
+        # Build a chain 5 levels deep
+        node = self._make_layer("level_5")
+        for i in range(4, -1, -1):
+            node = self._make_layer(f"level_{i}", children=[node])
+        result = collect_layers_depth_first(node, max_depth=3)
+        depths = [n["depth"] for n in result]
+        assert max(depths) <= 3
+
+    # ── Circular reference handling ───────────────────────────────────────────
+
+    def test_circular_reference_does_not_loop(self):
+        """Circular references are detected and do not cause infinite loops."""
+        child = self._make_layer("child")
+        root = self._make_layer("root", children=[child])
+        # Manually create a circular reference: child points back to root
+        child["children"] = [root]
+        result = collect_layers_depth_first(root)
+        # Should terminate; root and child each appear exactly once
+        ids = [n["id"] for n in result]
+        assert ids.count("root") == 1
+        assert ids.count("child") == 1
+
+    def test_shared_subtree_visited_once(self):
+        """A node referenced from multiple parents is only visited once."""
+        shared = self._make_layer("shared")
+        root = self._make_layer("root", children=[
+            self._make_layer("A", children=[shared]),
+            self._make_layer("B", children=[shared]),  # same object
+        ])
+        result = collect_layers_depth_first(root)
+        ids = [n["id"] for n in result]
+        assert ids.count("shared") == 1
+
+    # ── Output structure ──────────────────────────────────────────────────────
+
+    def test_children_key_not_in_output(self):
+        """The 'children' key is stripped from collected layer dicts."""
+        root = self._make_layer("A", children=[self._make_layer("B")])
+        result = collect_layers_depth_first(root)
+        for node in result:
+            assert "children" not in node
+
+    def test_original_properties_preserved(self):
+        """Non-traversal properties (name, type, x, y, etc.) are preserved."""
+        root = self._make_layer("A", type="FRAME", x=10, y=20, width=100, height=200)
+        result = collect_layers_depth_first(root)
+        assert result[0]["type"] == "FRAME"
+        assert result[0]["x"] == 10
+        assert result[0]["y"] == 20
+        assert result[0]["width"] == 100
+        assert result[0]["height"] == 200
+
+    def test_original_tree_not_mutated(self):
+        """The original layer tree is not mutated by the traversal."""
+        root = self._make_layer("A", children=[self._make_layer("B")])
+        original_children_count = len(root["children"])
+        collect_layers_depth_first(root)
+        assert len(root["children"]) == original_children_count
+        assert "depth" not in root
+        assert "z_order" not in root
+
+    def test_empty_root_returns_empty_list(self):
+        """An empty dict root returns an empty list."""
+        result = collect_layers_depth_first({})
+        assert result == []
+
+    def test_none_root_returns_empty_list(self):
+        """A None root returns an empty list."""
+        result = collect_layers_depth_first(None)  # type: ignore[arg-type]
+        assert result == []
+
+    def test_100_layers_collected(self):
+        """FR1.7: Trees with up to 100 layers are fully collected."""
+        # Build a wide flat tree: root + 99 children
+        children = [self._make_layer(f"child_{i}") for i in range(99)]
+        root = self._make_layer("root", children=children)
+        result = collect_layers_depth_first(root)
+        assert len(result) == 100
+
+    def test_z_order_reflects_dfs_order(self):
+        """z_order values match the DFS traversal order exactly."""
+        root = self._make_layer("A", children=[
+            self._make_layer("B", children=[
+                self._make_layer("D"),
+                self._make_layer("E"),
+            ]),
+            self._make_layer("C"),
+        ])
+        result = collect_layers_depth_first(root)
+        # Expected DFS order: A(0), B(1), D(2), E(3), C(4)
+        expected = [("A", 0), ("B", 1), ("D", 2), ("E", 3), ("C", 4)]
+        for node, (expected_id, expected_z) in zip(result, expected):
+            assert node["id"] == expected_id
+            assert node["z_order"] == expected_z
+
+
+# ── _truncate_layer_tree (DFS-based summary) ──────────────────────────────────
+
+class TestTruncateLayerTree:
+    """Tests for the updated _truncate_layer_tree() that uses DFS traversal."""
+
+    @staticmethod
+    def _make_layer(id: str, name: str = "", children: list | None = None,
+                    **kwargs) -> dict:
+        node: dict = {"id": id, "name": name or id}
+        node.update(kwargs)
+        if children is not None:
+            node["children"] = children
+        return node
+
+    def test_returns_string(self):
+        """_truncate_layer_tree always returns a string."""
+        root = self._make_layer("root")
+        result = _truncate_layer_tree(root)
+        assert isinstance(result, str)
+
+    def test_depth_and_z_order_in_output(self):
+        """Output JSON contains depth and z_order fields."""
+        import json
+        root = self._make_layer("A", children=[self._make_layer("B")])
+        result = _truncate_layer_tree(root)
+        # Remove truncation marker if present
+        clean = result.replace("\n... (truncated)", "")
+        data = json.loads(clean)
+        assert any("depth" in entry for entry in data)
+        assert any("z_order" in entry for entry in data)
+
+    def test_blobs_stripped(self):
+        """exportedImageBase64, exportedSvg, fullPngBase64 are stripped."""
+        root = self._make_layer(
+            "A",
+            exportedImageBase64="AAAA",
+            exportedSvg="<svg/>",
+            fullPngBase64="BBBB",
+        )
+        result = _truncate_layer_tree(root)
+        assert "exportedImageBase64" not in result
+        assert "exportedSvg" not in result
+        assert "fullPngBase64" not in result
+
+    def test_truncation_applied(self):
+        """Output is truncated to max_chars and appends truncation marker."""
+        # Build a tree large enough to exceed a tiny max_chars
+        children = [self._make_layer(f"child_{i}", x=i, y=i, width=100, height=50)
+                    for i in range(50)]
+        root = self._make_layer("root", children=children)
+        result = _truncate_layer_tree(root, max_chars=200)
+        assert len(result) <= 200 + len("\n... (truncated)")
+        assert result.endswith("\n... (truncated)")
+
+    def test_no_truncation_marker_when_short(self):
+        """No truncation marker when output fits within max_chars."""
+        root = self._make_layer("A")
+        result = _truncate_layer_tree(root, max_chars=10000)
+        assert not result.endswith("\n... (truncated)")
+
+    def test_invisible_layers_excluded(self):
+        """Invisible layers are excluded from the summary."""
+        root = self._make_layer("A", children=[
+            {**self._make_layer("B"), "visible": False},
+            self._make_layer("C"),
+        ])
+        result = _truncate_layer_tree(root)
+        assert '"B"' not in result or '"id": "B"' not in result

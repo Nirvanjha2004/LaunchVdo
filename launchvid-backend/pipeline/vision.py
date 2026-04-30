@@ -214,17 +214,122 @@ def validate_element_coordinates(element: dict, frame_width: int, frame_height: 
     return {**element, **corrected}
 
 
+# ── Layer Tree Traversal ───────────────────────────────────────────────────────
+
+def collect_layers_depth_first(root: dict, max_depth: int = 10) -> list[dict]:
+    """
+    Traverse a Figma layer tree using depth-first search (pre-order DFS) and
+    return a flat list of all visible layers enriched with traversal metadata.
+
+    The traversal:
+      - Visits each node *before* its children (pre-order: parent first).
+      - Skips invisible layers (``visible == False``).
+      - Handles circular references safely by tracking visited node IDs.
+      - Respects ``max_depth`` to prevent infinite recursion on deeply nested
+        trees (FR1.7: up to 100 layers within 10 seconds per frame).
+
+    Each collected layer dict is a **shallow copy** of the original node
+    (without its ``children`` key) enriched with two extra fields:
+
+    - ``depth``   – nesting level of the node (root = 0).
+    - ``z_order`` – sequential 0-based integer reflecting DFS traversal order.
+
+    Args:
+        root:      Root node of the Figma layer tree (a dict with optional
+                   ``children`` list, ``id``, ``visible``, etc.).
+        max_depth: Maximum nesting depth to traverse.  Nodes deeper than this
+                   are silently skipped.  Defaults to 10.
+
+    Returns:
+        Flat list of layer dicts in DFS pre-order, each enriched with
+        ``depth`` and ``z_order``.  Invisible layers and nodes beyond
+        ``max_depth`` are excluded.
+    """
+    result: list[dict] = []
+    visited: set[str] = set()
+
+    def _dfs(node: dict, depth: int) -> None:
+        # Respect max_depth limit
+        if depth > max_depth:
+            return
+
+        # Skip invisible layers
+        if node.get("visible") is False:
+            return
+
+        # Circular reference guard (only for nodes that have an id)
+        node_id = node.get("id")
+        if node_id is not None:
+            if node_id in visited:
+                return
+            visited.add(node_id)
+
+        # Build enriched copy (exclude children to keep the flat list clean)
+        enriched = {k: v for k, v in node.items() if k != "children"}
+        enriched["depth"] = depth
+        enriched["z_order"] = len(result)  # assigned before appending
+        result.append(enriched)
+
+        # Recurse into children (DFS pre-order: parent already added above)
+        for child in node.get("children", []) or []:
+            _dfs(child, depth + 1)
+
+    if root:
+        _dfs(root, depth=0)
+
+    return result
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _truncate_layer_tree(layers: dict, max_chars: int = 4000) -> str:
     """
-    Truncate the layer tree JSON to stay within Gemini's context window.
-    Strips exportedImageBase64 and exportedSvg from child nodes (too large)
-    but keeps them at the top level for reference.
+    Build an informative layer summary for the Gemini prompt.
+
+    Uses ``collect_layers_depth_first`` to produce a flat, ordered list of
+    visible layers enriched with ``depth`` and ``z_order``.  Each layer entry
+    retains its key properties (id, name, type, x, y, width, height, opacity,
+    visible) while large binary blobs (exportedImageBase64, exportedSvg,
+    fullPngBase64) are stripped to keep the prompt within Gemini's context
+    window.
+
+    Falls back to the legacy strip-and-truncate approach when the layer tree
+    is empty or ``collect_layers_depth_first`` returns no results.
+
+    Args:
+        layers:    Root node of the Figma layer tree.
+        max_chars: Maximum character length of the returned string.
+
+    Returns:
+        JSON string (possibly truncated) suitable for embedding in the Gemini
+        prompt.
     """
+    _BLOB_KEYS = frozenset({"exportedImageBase64", "exportedSvg", "fullPngBase64"})
+
+    # --- Attempt DFS-based summary -------------------------------------------
+    flat_layers = collect_layers_depth_first(layers, max_depth=10)
+
+    if flat_layers:
+        # Build a compact representation: keep key properties + depth/z_order
+        _KEEP_KEYS = frozenset({
+            "id", "name", "type", "x", "y", "width", "height",
+            "opacity", "visible", "depth", "z_order",
+            # Preserve text content and fill info for Gemini
+            "characters", "fills", "strokes", "cornerRadius",
+            "absoluteBoundingBox", "constraints",
+        })
+        summary = []
+        for layer in flat_layers:
+            entry = {k: v for k, v in layer.items()
+                     if k in _KEEP_KEYS and k not in _BLOB_KEYS}
+            summary.append(entry)
+
+        serialized = json.dumps(summary, indent=2)
+        return serialized[:max_chars] + ("\n... (truncated)" if len(serialized) > max_chars else "")
+
+    # --- Legacy fallback: strip blobs and truncate ---------------------------
     def strip_blobs(node: dict, depth: int = 0) -> dict:
-        cleaned = {k: v for k, v in node.items()
-                   if k not in ("exportedImageBase64", "exportedSvg", "fullPngBase64")}
+        cleaned = {k: v for k, v in node.items() if k not in _BLOB_KEYS}
         if "children" in node and depth < 3:
             cleaned["children"] = [strip_blobs(c, depth + 1) for c in node.get("children", [])]
         else:
