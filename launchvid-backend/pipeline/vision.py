@@ -214,6 +214,177 @@ def validate_element_coordinates(element: dict, frame_width: int, frame_height: 
     return {**element, **corrected}
 
 
+# ── Element Bounds Calculation ────────────────────────────────────────────────
+
+def calculate_element_bounds(
+    layer: dict,
+    frame_width: int,
+    frame_height: int,
+    export_scale: float = 1.0,
+) -> dict:
+    """
+    Calculate an element's bounding box in the frame's coordinate space,
+    handling Figma's ``absoluteBoundingBox`` vs relative x/y, export scale
+    factors, and normalized bounds.
+
+    Figma layers can carry two kinds of positional data:
+
+    * **Relative x/y** – coordinates relative to the parent frame/group.
+    * **absoluteBoundingBox** – coordinates in the global Figma canvas space.
+
+    When ``absoluteBoundingBox`` is present the function converts it to
+    frame-relative coordinates by subtracting the frame's own canvas origin
+    (taken from the layer's ``frameOrigin`` field, or defaulting to ``(0, 0)``
+    when not provided).
+
+    The export scale factor accounts for Figma exports at different
+    resolutions (e.g. 2× exports double all pixel values).  Dividing by
+    ``export_scale`` converts back to logical (1×) pixel coordinates.
+
+    Args:
+        layer:        A Figma layer dict.  May contain any combination of:
+                      ``x``, ``y``, ``width``, ``height`` (relative coords),
+                      ``absoluteBoundingBox`` (dict with ``x``, ``y``,
+                      ``width``, ``height`` in canvas space),
+                      ``frameOrigin`` (dict with ``x``, ``y`` giving the
+                      frame's canvas origin, used to convert absolute coords
+                      to frame-relative coords).
+        frame_width:  Width of the containing frame in logical pixels (after
+                      any scale correction).
+        frame_height: Height of the containing frame in logical pixels.
+        export_scale: Scale factor used when the frame was exported (e.g.
+                      ``2.0`` for a 2× export).  All raw pixel values are
+                      divided by this factor.  Must be > 0; defaults to 1.0.
+
+    Returns:
+        dict with the following keys:
+
+        * ``x`` (int)      – frame-relative left edge in logical pixels.
+        * ``y`` (int)      – frame-relative top edge in logical pixels.
+        * ``width`` (int)  – element width in logical pixels (≥ 1).
+        * ``height`` (int) – element height in logical pixels (≥ 1).
+        * ``bounds_normalized`` (dict) – normalised bounds relative to the
+          frame dimensions, each value a float in [0.0, 1.0]:
+
+          * ``left``   – x / frame_width
+          * ``top``    – y / frame_height
+          * ``right``  – (x + width) / frame_width
+          * ``bottom`` – (y + height) / frame_height
+    """
+    # --- 0. Sanitise scale factor -------------------------------------------
+    if not export_scale or export_scale <= 0:
+        export_scale = 1.0
+
+    # --- 1. Prefer absoluteBoundingBox when available -----------------------
+    abs_bb = layer.get("absoluteBoundingBox")
+    if abs_bb and isinstance(abs_bb, dict):
+        # Canvas-space coordinates
+        canvas_x      = abs_bb.get("x", 0) or 0
+        canvas_y      = abs_bb.get("y", 0) or 0
+        raw_width     = abs_bb.get("width",  0) or 0
+        raw_height    = abs_bb.get("height", 0) or 0
+
+        # Frame's own canvas origin (so we can make coords frame-relative)
+        frame_origin  = layer.get("frameOrigin") or {}
+        origin_x      = frame_origin.get("x", 0) or 0
+        origin_y      = frame_origin.get("y", 0) or 0
+
+        raw_x = canvas_x - origin_x
+        raw_y = canvas_y - origin_y
+    else:
+        # Fall back to relative x/y
+        raw_x      = layer.get("x", 0) or 0
+        raw_y      = layer.get("y", 0) or 0
+        raw_width  = layer.get("width",  0) or 0
+        raw_height = layer.get("height", 0) or 0
+
+    # --- 2. Apply export scale factor ---------------------------------------
+    raw_x      = raw_x      / export_scale
+    raw_y      = raw_y      / export_scale
+    raw_width  = raw_width  / export_scale
+    raw_height = raw_height / export_scale
+
+    # --- 3. Round to nearest integer (±1px accuracy) -----------------------
+    x      = int(round(raw_x))
+    y      = int(round(raw_y))
+    width  = int(round(raw_width))
+    height = int(round(raw_height))
+
+    # --- 4. Ensure positive dimensions -------------------------------------
+    width  = max(1, width)
+    height = max(1, height)
+
+    # --- 5. Clamp to frame bounds ------------------------------------------
+    x = max(0, min(x, frame_width  - 1))
+    y = max(0, min(y, frame_height - 1))
+    width  = min(width,  frame_width  - x)
+    height = min(height, frame_height - y)
+
+    # Final safety: dimensions must be at least 1px after clamping
+    width  = max(1, width)
+    height = max(1, height)
+
+    # --- 6. Compute normalised bounds (0.0 – 1.0) --------------------------
+    # Guard against zero-dimension frames (should never happen in practice)
+    fw = frame_width  if frame_width  > 0 else 1
+    fh = frame_height if frame_height > 0 else 1
+
+    bounds_normalized = {
+        "left":   x / fw,
+        "top":    y / fh,
+        "right":  (x + width)  / fw,
+        "bottom": (y + height) / fh,
+    }
+
+    return {
+        "x":                x,
+        "y":                y,
+        "width":            width,
+        "height":           height,
+        "bounds_normalized": bounds_normalized,
+    }
+
+
+def calculate_relative_size(
+    element: dict,
+    frame_width: int,
+    frame_height: int,
+) -> float:
+    """
+    Return a normalised size score (0.0 – 1.0) representing how much of the
+    frame the element occupies by area.
+
+    The score is the ratio of the element's area to the frame's total area,
+    clamped to [0.0, 1.0].  It is useful for visual hierarchy analysis: a
+    full-screen background returns 1.0, a small icon returns a value close
+    to 0.0.
+
+    Args:
+        element:      A dict with at least ``width`` and ``height`` keys
+                      (integer or float pixel values).  Missing or non-positive
+                      values are treated as 0.
+        frame_width:  Width of the containing frame in pixels (must be > 0).
+        frame_height: Height of the containing frame in pixels (must be > 0).
+
+    Returns:
+        Float in [0.0, 1.0] representing the element's area as a fraction of
+        the frame area.  Returns 0.0 when the frame has zero area or the
+        element has non-positive dimensions.
+    """
+    frame_area = frame_width * frame_height
+    if frame_area <= 0:
+        return 0.0
+
+    elem_width  = element.get("width",  0) or 0
+    elem_height = element.get("height", 0) or 0
+
+    if elem_width <= 0 or elem_height <= 0:
+        return 0.0
+
+    ratio = (elem_width * elem_height) / frame_area
+    return min(1.0, max(0.0, ratio))
+
+
 # ── Layer Tree Traversal ───────────────────────────────────────────────────────
 
 def collect_layers_depth_first(root: dict, max_depth: int = 10) -> list[dict]:

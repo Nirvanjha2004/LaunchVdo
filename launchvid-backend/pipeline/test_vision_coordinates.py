@@ -23,6 +23,8 @@ with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
                 validate_element_coordinates,
                 collect_layers_depth_first,
                 _truncate_layer_tree,
+                calculate_element_bounds,
+                calculate_relative_size,
             )
 
 
