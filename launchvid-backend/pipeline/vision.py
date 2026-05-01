@@ -385,6 +385,168 @@ def calculate_relative_size(
     return min(1.0, max(0.0, ratio))
 
 
+# ── Element Overlap Detection and Z-Index Analysis ────────────────────────────
+
+def detect_element_overlaps(elements: list[dict]) -> list[dict]:
+    """
+    Detect overlapping elements and calculate overlap areas.
+
+    For each pair of elements, computes the intersection rectangle.  If the
+    intersection has positive area, an overlap record is emitted.
+
+    The ``overlap_ratio`` is the overlap area divided by the area of the
+    *smaller* element (the one with the lesser area).  This gives a value in
+    [0.0, 1.0] that represents how much of the smaller element is covered.
+
+    Args:
+        elements: List of element dicts, each containing at minimum:
+                  ``layer_id`` (str), ``x`` (int), ``y`` (int),
+                  ``width`` (int), ``height`` (int).
+
+    Returns:
+        List of overlap records, each a dict with:
+        - ``element_a_id`` (str) – layer_id of the first element.
+        - ``element_b_id`` (str) – layer_id of the second element.
+        - ``overlap_area``  (int) – pixel area of the intersection rectangle.
+        - ``overlap_ratio`` (float) – overlap_area / area of the smaller element.
+    """
+    overlaps: list[dict] = []
+
+    for i in range(len(elements)):
+        for j in range(i + 1, len(elements)):
+            a = elements[i]
+            b = elements[j]
+
+            # Compute intersection rectangle
+            ax1, ay1 = a.get("x", 0), a.get("y", 0)
+            ax2 = ax1 + max(a.get("width", 0), 0)
+            ay2 = ay1 + max(a.get("height", 0), 0)
+
+            bx1, by1 = b.get("x", 0), b.get("y", 0)
+            bx2 = bx1 + max(b.get("width", 0), 0)
+            by2 = by1 + max(b.get("height", 0), 0)
+
+            inter_x1 = max(ax1, bx1)
+            inter_y1 = max(ay1, by1)
+            inter_x2 = min(ax2, bx2)
+            inter_y2 = min(ay2, by2)
+
+            inter_w = inter_x2 - inter_x1
+            inter_h = inter_y2 - inter_y1
+
+            if inter_w <= 0 or inter_h <= 0:
+                continue  # no overlap
+
+            overlap_area = int(inter_w * inter_h)
+
+            area_a = max(a.get("width", 0), 0) * max(a.get("height", 0), 0)
+            area_b = max(b.get("width", 0), 0) * max(b.get("height", 0), 0)
+            smaller_area = min(area_a, area_b)
+
+            overlap_ratio = (overlap_area / smaller_area) if smaller_area > 0 else 0.0
+
+            overlaps.append({
+                "element_a_id": a.get("layer_id", ""),
+                "element_b_id": b.get("layer_id", ""),
+                "overlap_area": overlap_area,
+                "overlap_ratio": overlap_ratio,
+            })
+
+    return overlaps
+
+
+def assign_z_indices(layers: list[dict]) -> list[dict]:
+    """
+    Assign z-index values to a flat list of layers produced by
+    ``collect_layers_depth_first``.
+
+    The z-index reflects the visual stacking order: elements that appear
+    *later* in DFS traversal order (higher ``z_order``) and elements that are
+    *deeper* in the tree (higher ``depth``) should appear above their
+    predecessors.
+
+    Formula::
+
+        z_index = z_order * (max_depth + 1) + depth
+
+    This ensures:
+    - Children always have a higher z-index than their parent.
+    - Later siblings always have a higher z-index than earlier siblings.
+
+    Args:
+        layers: Flat list of layer dicts as returned by
+                ``collect_layers_depth_first``.  Each dict must have
+                ``z_order`` (int) and ``depth`` (int) fields.
+
+    Returns:
+        A new list of layer dicts (shallow copies) with a ``z_index`` (int)
+        field added to each.  The input list is not mutated.
+    """
+    if not layers:
+        return []
+
+    max_depth = max((layer.get("depth", 0) for layer in layers), default=0)
+    depth_factor = max_depth + 1  # multiplier so depth never overflows into z_order
+
+    result = []
+    for layer in layers:
+        z_order = layer.get("z_order", 0)
+        depth = layer.get("depth", 0)
+        z_index = z_order * depth_factor + depth
+        result.append({**layer, "z_index": z_index})
+
+    return result
+
+
+def analyze_visual_stack(elements: list[dict]) -> list[dict]:
+    """
+    Enrich each element with overlap information derived from
+    ``detect_element_overlaps``.
+
+    Each element in the returned list gains two new fields:
+
+    - ``overlaps_with`` (list[str]) – layer_ids of elements that overlap with
+      this element.
+    - ``overlap_count`` (int) – number of elements this element overlaps with.
+
+    Args:
+        elements: List of element dicts from Gemini analysis.  Each dict must
+                  have a ``layer_id`` key and valid ``x``, ``y``, ``width``,
+                  ``height`` values.
+
+    Returns:
+        A new list of element dicts (shallow copies) enriched with
+        ``overlaps_with`` and ``overlap_count``.  The input list is not
+        mutated.
+    """
+    overlap_records = detect_element_overlaps(elements)
+
+    # Build a mapping: layer_id → set of overlapping layer_ids
+    overlap_map: dict[str, set[str]] = {
+        elem.get("layer_id", ""): set() for elem in elements
+    }
+
+    for record in overlap_records:
+        id_a = record["element_a_id"]
+        id_b = record["element_b_id"]
+        if id_a in overlap_map:
+            overlap_map[id_a].add(id_b)
+        if id_b in overlap_map:
+            overlap_map[id_b].add(id_a)
+
+    result = []
+    for element in elements:
+        layer_id = element.get("layer_id", "")
+        overlapping_ids = sorted(overlap_map.get(layer_id, set()))
+        result.append({
+            **element,
+            "overlaps_with": overlapping_ids,
+            "overlap_count": len(overlapping_ids),
+        })
+
+    return result
+
+
 # ── Layer Tree Traversal ───────────────────────────────────────────────────────
 
 def collect_layers_depth_first(root: dict, max_depth: int = 10) -> list[dict]:
@@ -614,6 +776,29 @@ async def analyze_frame(frame: dict) -> dict:
                 anim["__y"] = layer_meta.get("y")
                 anim["__height"] = layer_meta.get("height")
 
+            # Task 1.1.5: Enrich elements with overlap detection and z-index analysis
+            if "elements" in result:
+                # Build a z_index lookup from the DFS layer traversal so that
+                # stacking order is grounded in the actual Figma layer tree
+                # rather than relying solely on Gemini's z_index estimates.
+                flat_layers = collect_layers_depth_first(layers, max_depth=10)
+                layers_with_z = assign_z_indices(flat_layers)
+                z_index_by_id: dict[str, int] = {
+                    layer.get("id", ""): layer["z_index"]
+                    for layer in layers_with_z
+                    if layer.get("id")
+                }
+
+                # Override each element's z_index with the tree-derived value
+                # when available; keep Gemini's value as a fallback.
+                for element in result["elements"]:
+                    lid = element.get("layer_id", "")
+                    if lid in z_index_by_id:
+                        element["z_index"] = z_index_by_id[lid]
+
+                # Enrich with pairwise overlap data
+                result["elements"] = analyze_visual_stack(result["elements"])
+
             # FIX 4 applied: Apply semantic rules to animation sequence
             if "animation_sequence" in result:
                 result["animation_sequence"] = apply_semantic_rules(result["animation_sequence"])
@@ -719,6 +904,21 @@ def _fallback_analysis(frame: dict) -> dict:
             "duration_ms": 400,
             "easing":     "ease_out",
         })
+
+    # Task 1.1.5: Assign z-indices from DFS traversal, then enrich with overlap data
+    flat_layers = collect_layers_depth_first(layers, max_depth=10)
+    layers_with_z = assign_z_indices(flat_layers)
+    z_index_by_id: dict[str, int] = {
+        layer.get("id", ""): layer["z_index"]
+        for layer in layers_with_z
+        if layer.get("id")
+    }
+    for element in elements:
+        lid = element.get("layer_id", "")
+        if lid in z_index_by_id:
+            element["z_index"] = z_index_by_id[lid]
+
+    elements = analyze_visual_stack(elements)
 
     return {
         "frame_name":         frame.get("frameName", "Unknown"),

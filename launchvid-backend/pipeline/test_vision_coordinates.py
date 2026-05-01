@@ -25,6 +25,9 @@ with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
                 _truncate_layer_tree,
                 calculate_element_bounds,
                 calculate_relative_size,
+                detect_element_overlaps,
+                assign_z_indices,
+                analyze_visual_stack,
             )
 
 
@@ -557,3 +560,590 @@ class TestTruncateLayerTree:
         ])
         result = _truncate_layer_tree(root)
         assert '"B"' not in result or '"id": "B"' not in result
+
+
+# ── calculate_element_bounds ──────────────────────────────────────────────────
+
+class TestCalculateElementBounds:
+    """Tests for calculate_element_bounds()."""
+
+    FRAME_W = 390
+    FRAME_H = 844
+
+    # ── Basic relative x/y path ───────────────────────────────────────────────
+
+    def test_basic_relative_coords(self):
+        """Relative x/y/width/height are returned as integers within bounds."""
+        layer = {"x": 10, "y": 20, "width": 100, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["x"] == 10
+        assert result["y"] == 20
+        assert result["width"] == 100
+        assert result["height"] == 50
+
+    def test_return_keys_present(self):
+        """Result always contains x, y, width, height, and bounds_normalized."""
+        layer = {"x": 0, "y": 0, "width": 50, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert "x" in result
+        assert "y" in result
+        assert "width" in result
+        assert "height" in result
+        assert "bounds_normalized" in result
+
+    def test_bounds_normalized_keys(self):
+        """bounds_normalized contains left, top, right, bottom."""
+        layer = {"x": 0, "y": 0, "width": 50, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        bn = result["bounds_normalized"]
+        assert "left" in bn
+        assert "top" in bn
+        assert "right" in bn
+        assert "bottom" in bn
+
+    def test_bounds_normalized_values_range(self):
+        """All bounds_normalized values are in [0.0, 1.0]."""
+        layer = {"x": 50, "y": 100, "width": 200, "height": 300}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        bn = result["bounds_normalized"]
+        for key, val in bn.items():
+            assert 0.0 <= val <= 1.0, f"{key}={val} out of range"
+
+    def test_bounds_normalized_full_frame(self):
+        """A full-frame element has normalized bounds of 0.0 and 1.0."""
+        layer = {"x": 0, "y": 0, "width": self.FRAME_W, "height": self.FRAME_H}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        bn = result["bounds_normalized"]
+        assert bn["left"] == pytest.approx(0.0)
+        assert bn["top"] == pytest.approx(0.0)
+        assert bn["right"] == pytest.approx(1.0)
+        assert bn["bottom"] == pytest.approx(1.0)
+
+    def test_bounds_normalized_center_element(self):
+        """A centered element has correct normalized bounds."""
+        # Element at x=195, y=422, width=100, height=100 on 390×844 frame
+        layer = {"x": 195, "y": 422, "width": 100, "height": 100}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        bn = result["bounds_normalized"]
+        assert bn["left"] == pytest.approx(195 / 390)
+        assert bn["top"] == pytest.approx(422 / 844)
+        assert bn["right"] == pytest.approx((195 + 100) / 390)
+        assert bn["bottom"] == pytest.approx((422 + 100) / 844)
+
+    def test_return_types_are_int(self):
+        """x, y, width, height are Python ints."""
+        layer = {"x": 10.7, "y": 20.3, "width": 100.5, "height": 50.4}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        for key in ("x", "y", "width", "height"):
+            assert isinstance(result[key], int), f"{key} should be int"
+
+    def test_bounds_normalized_types_are_float(self):
+        """bounds_normalized values are floats."""
+        layer = {"x": 10, "y": 20, "width": 100, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        for key, val in result["bounds_normalized"].items():
+            assert isinstance(val, float), f"{key} should be float"
+
+    # ── absoluteBoundingBox path ──────────────────────────────────────────────
+
+    def test_absolute_bounding_box_used_when_present(self):
+        """absoluteBoundingBox takes precedence over relative x/y."""
+        layer = {
+            "x": 999,  # should be ignored
+            "y": 999,
+            "width": 999,
+            "height": 999,
+            "absoluteBoundingBox": {"x": 50, "y": 100, "width": 200, "height": 80},
+        }
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["x"] == 50
+        assert result["y"] == 100
+        assert result["width"] == 200
+        assert result["height"] == 80
+
+    def test_absolute_bounding_box_with_frame_origin(self):
+        """Canvas coords are converted to frame-relative by subtracting frameOrigin."""
+        # Frame starts at canvas (100, 200); element at canvas (150, 250)
+        # → frame-relative: x=50, y=50
+        layer = {
+            "absoluteBoundingBox": {"x": 150, "y": 250, "width": 100, "height": 60},
+            "frameOrigin": {"x": 100, "y": 200},
+        }
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["x"] == 50
+        assert result["y"] == 50
+        assert result["width"] == 100
+        assert result["height"] == 60
+
+    def test_absolute_bounding_box_no_frame_origin_defaults_to_zero(self):
+        """When frameOrigin is absent, canvas coords are used as-is (origin = 0,0)."""
+        layer = {
+            "absoluteBoundingBox": {"x": 30, "y": 40, "width": 80, "height": 60},
+        }
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["x"] == 30
+        assert result["y"] == 40
+
+    def test_absolute_bounding_box_negative_after_origin_subtraction_clamped(self):
+        """Negative frame-relative coords (after origin subtraction) are clamped to 0."""
+        # Element at canvas (50, 60), frame origin at (100, 100)
+        # → frame-relative: x=-50, y=-40 → clamped to 0
+        layer = {
+            "absoluteBoundingBox": {"x": 50, "y": 60, "width": 80, "height": 60},
+            "frameOrigin": {"x": 100, "y": 100},
+        }
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["x"] == 0
+        assert result["y"] == 0
+
+    # ── Export scale factor ───────────────────────────────────────────────────
+
+    def test_export_scale_2x_halves_coordinates(self):
+        """2× export scale divides all coordinates by 2."""
+        layer = {"x": 20, "y": 40, "width": 200, "height": 100}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H, export_scale=2.0)
+        assert result["x"] == 10
+        assert result["y"] == 20
+        assert result["width"] == 100
+        assert result["height"] == 50
+
+    def test_export_scale_3x(self):
+        """3× export scale divides all coordinates by 3."""
+        layer = {"x": 30, "y": 60, "width": 300, "height": 150}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H, export_scale=3.0)
+        assert result["x"] == 10
+        assert result["y"] == 20
+        assert result["width"] == 100
+        assert result["height"] == 50
+
+    def test_export_scale_1x_no_change(self):
+        """1× export scale (default) does not alter coordinates."""
+        layer = {"x": 10, "y": 20, "width": 100, "height": 50}
+        result_default = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        result_explicit = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H, export_scale=1.0)
+        assert result_default["x"] == result_explicit["x"]
+        assert result_default["y"] == result_explicit["y"]
+        assert result_default["width"] == result_explicit["width"]
+        assert result_default["height"] == result_explicit["height"]
+
+    def test_export_scale_zero_treated_as_one(self):
+        """export_scale=0 (invalid) is treated as 1.0 to avoid division by zero."""
+        layer = {"x": 10, "y": 20, "width": 100, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H, export_scale=0)
+        assert result["x"] == 10
+        assert result["y"] == 20
+
+    def test_export_scale_negative_treated_as_one(self):
+        """Negative export_scale is treated as 1.0."""
+        layer = {"x": 10, "y": 20, "width": 100, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H, export_scale=-2.0)
+        assert result["x"] == 10
+        assert result["y"] == 20
+
+    def test_export_scale_with_absolute_bounding_box(self):
+        """Export scale is applied to absoluteBoundingBox coordinates too."""
+        layer = {
+            "absoluteBoundingBox": {"x": 40, "y": 80, "width": 200, "height": 100},
+        }
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H, export_scale=2.0)
+        assert result["x"] == 20
+        assert result["y"] == 40
+        assert result["width"] == 100
+        assert result["height"] == 50
+
+    # ── Clamping and edge cases ───────────────────────────────────────────────
+
+    def test_negative_x_clamped(self):
+        """Negative x is clamped to 0."""
+        layer = {"x": -10, "y": 20, "width": 100, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["x"] == 0
+
+    def test_x_beyond_frame_clamped(self):
+        """x beyond frame_width - 1 is clamped."""
+        layer = {"x": 500, "y": 10, "width": 50, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["x"] == self.FRAME_W - 1
+
+    def test_width_clamped_to_frame_right_edge(self):
+        """x + width does not exceed frame_width."""
+        layer = {"x": 300, "y": 10, "width": 200, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["x"] + result["width"] <= self.FRAME_W
+
+    def test_zero_width_becomes_one(self):
+        """Zero width is corrected to 1."""
+        layer = {"x": 10, "y": 10, "width": 0, "height": 50}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["width"] >= 1
+
+    def test_missing_keys_default_safely(self):
+        """Missing x/y/width/height default to 0 (width/height become 1)."""
+        result = calculate_element_bounds({}, self.FRAME_W, self.FRAME_H)
+        assert result["x"] == 0
+        assert result["y"] == 0
+        assert result["width"] >= 1
+        assert result["height"] >= 1
+
+    def test_bounds_normalized_right_gt_left(self):
+        """bounds_normalized right is always >= left."""
+        layer = {"x": 50, "y": 50, "width": 100, "height": 100}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        bn = result["bounds_normalized"]
+        assert bn["right"] >= bn["left"]
+
+    def test_bounds_normalized_bottom_gt_top(self):
+        """bounds_normalized bottom is always >= top."""
+        layer = {"x": 50, "y": 50, "width": 100, "height": 100}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        bn = result["bounds_normalized"]
+        assert bn["bottom"] >= bn["top"]
+
+    def test_float_coords_rounded(self):
+        """Float coordinates are rounded to nearest integer (±1px accuracy)."""
+        layer = {"x": 10.4, "y": 20.6, "width": 100.3, "height": 50.7}
+        result = calculate_element_bounds(layer, self.FRAME_W, self.FRAME_H)
+        assert result["x"] == 10
+        assert result["y"] == 21
+        assert result["width"] == 100
+        assert result["height"] == 51
+
+
+# ── calculate_relative_size ───────────────────────────────────────────────────
+
+class TestCalculateRelativeSize:
+    """Tests for calculate_relative_size()."""
+
+    FRAME_W = 390
+    FRAME_H = 844
+
+    def test_full_frame_element_returns_one(self):
+        """An element covering the entire frame returns 1.0."""
+        element = {"width": self.FRAME_W, "height": self.FRAME_H}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        assert result == pytest.approx(1.0)
+
+    def test_half_frame_element(self):
+        """An element covering half the frame returns ~0.5."""
+        element = {"width": self.FRAME_W, "height": self.FRAME_H // 2}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        assert result == pytest.approx((self.FRAME_W * (self.FRAME_H // 2)) / (self.FRAME_W * self.FRAME_H))
+
+    def test_small_icon_returns_small_value(self):
+        """A 24×24 icon on a 390×844 frame returns a small value."""
+        element = {"width": 24, "height": 24}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        expected = (24 * 24) / (self.FRAME_W * self.FRAME_H)
+        assert result == pytest.approx(expected)
+        assert result < 0.01  # should be very small
+
+    def test_return_type_is_float(self):
+        """Return value is always a float."""
+        element = {"width": 100, "height": 100}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        assert isinstance(result, float)
+
+    def test_result_in_range_zero_to_one(self):
+        """Result is always in [0.0, 1.0]."""
+        element = {"width": 200, "height": 400}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        assert 0.0 <= result <= 1.0
+
+    def test_oversized_element_clamped_to_one(self):
+        """An element larger than the frame is clamped to 1.0."""
+        element = {"width": 9999, "height": 9999}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        assert result == pytest.approx(1.0)
+
+    def test_zero_width_returns_zero(self):
+        """An element with zero width returns 0.0."""
+        element = {"width": 0, "height": 100}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        assert result == 0.0
+
+    def test_zero_height_returns_zero(self):
+        """An element with zero height returns 0.0."""
+        element = {"width": 100, "height": 0}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        assert result == 0.0
+
+    def test_negative_width_returns_zero(self):
+        """An element with negative width returns 0.0."""
+        element = {"width": -50, "height": 100}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        assert result == 0.0
+
+    def test_missing_dimensions_returns_zero(self):
+        """An element with missing width/height returns 0.0."""
+        result = calculate_relative_size({}, self.FRAME_W, self.FRAME_H)
+        assert result == 0.0
+
+    def test_zero_frame_area_returns_zero(self):
+        """A frame with zero area returns 0.0 (no division by zero)."""
+        element = {"width": 100, "height": 100}
+        result = calculate_relative_size(element, 0, 0)
+        assert result == 0.0
+
+    def test_zero_frame_width_returns_zero(self):
+        """A frame with zero width returns 0.0."""
+        element = {"width": 100, "height": 100}
+        result = calculate_relative_size(element, 0, self.FRAME_H)
+        assert result == 0.0
+
+    def test_area_ratio_calculation(self):
+        """Area ratio is element_area / frame_area."""
+        element = {"width": 100, "height": 100}
+        result = calculate_relative_size(element, 200, 200)
+        expected = (100 * 100) / (200 * 200)  # 0.25
+        assert result == pytest.approx(expected)
+
+    def test_float_dimensions_accepted(self):
+        """Float width/height values are accepted and produce correct ratio."""
+        element = {"width": 195.0, "height": 422.0}
+        result = calculate_relative_size(element, self.FRAME_W, self.FRAME_H)
+        expected = (195.0 * 422.0) / (self.FRAME_W * self.FRAME_H)
+        assert result == pytest.approx(min(1.0, expected))
+
+    def test_square_frame_quarter_element(self):
+        """A quarter-sized element on a square frame returns 0.25."""
+        element = {"width": 50, "height": 50}
+        result = calculate_relative_size(element, 100, 100)
+        assert result == pytest.approx(0.25)
+
+
+# ── detect_element_overlaps ───────────────────────────────────────────────────
+
+class TestDetectElementOverlaps:
+    """Tests for detect_element_overlaps()."""
+
+    @staticmethod
+    def _elem(layer_id: str, x: int, y: int, w: int, h: int) -> dict:
+        return {"layer_id": layer_id, "x": x, "y": y, "width": w, "height": h}
+
+    def test_no_overlap_returns_empty(self):
+        """Two non-overlapping elements return []."""
+        a = self._elem("a", 0, 0, 50, 50)
+        b = self._elem("b", 100, 100, 50, 50)
+        assert detect_element_overlaps([a, b]) == []
+
+    def test_adjacent_elements_no_overlap(self):
+        """Elements that touch at an edge (no area overlap) return []."""
+        a = self._elem("a", 0, 0, 50, 50)
+        b = self._elem("b", 50, 0, 50, 50)  # right edge of a == left edge of b
+        assert detect_element_overlaps([a, b]) == []
+
+    def test_partial_overlap_detected(self):
+        """Two partially overlapping elements return one record with correct overlap_area."""
+        a = self._elem("a", 0, 0, 100, 100)
+        b = self._elem("b", 50, 50, 100, 100)
+        result = detect_element_overlaps([a, b])
+        assert len(result) == 1
+        # Intersection: x=[50,100], y=[50,100] → 50×50 = 2500
+        assert result[0]["overlap_area"] == 2500
+
+    def test_full_containment_overlap(self):
+        """Small element fully inside large element: overlap_ratio should be 1.0."""
+        large = self._elem("large", 0, 0, 200, 200)
+        small = self._elem("small", 50, 50, 50, 50)
+        result = detect_element_overlaps([large, small])
+        assert len(result) == 1
+        assert result[0]["overlap_ratio"] == pytest.approx(1.0)
+
+    def test_overlap_ratio_range(self):
+        """overlap_ratio is always in [0.0, 1.0]."""
+        a = self._elem("a", 0, 0, 100, 100)
+        b = self._elem("b", 30, 30, 80, 80)
+        result = detect_element_overlaps([a, b])
+        for record in result:
+            assert 0.0 <= record["overlap_ratio"] <= 1.0
+
+    def test_symmetric_pairs(self):
+        """Each pair appears exactly once (no duplicates)."""
+        elements = [
+            self._elem("a", 0, 0, 100, 100),
+            self._elem("b", 50, 0, 100, 100),
+            self._elem("c", 0, 50, 100, 100),
+        ]
+        result = detect_element_overlaps(elements)
+        pairs = [(r["element_a_id"], r["element_b_id"]) for r in result]
+        # No pair should appear twice
+        assert len(pairs) == len(set(pairs))
+        # Each pair should be ordered (a_id < b_id in terms of list position)
+        for r in result:
+            ids = [e["layer_id"] for e in elements]
+            assert ids.index(r["element_a_id"]) < ids.index(r["element_b_id"])
+
+    def test_empty_list_returns_empty(self):
+        """Empty input returns []."""
+        assert detect_element_overlaps([]) == []
+
+    def test_single_element_returns_empty(self):
+        """Single element returns []."""
+        assert detect_element_overlaps([self._elem("a", 0, 0, 100, 100)]) == []
+
+    def test_overlap_area_calculation(self):
+        """Verify exact pixel area of intersection."""
+        # a: [0,0] to [80,60]; b: [20,10] to [100,50]
+        # intersection: x=[20,80], y=[10,50] → 60×40 = 2400
+        a = self._elem("a", 0, 0, 80, 60)
+        b = self._elem("b", 20, 10, 80, 40)
+        result = detect_element_overlaps([a, b])
+        assert len(result) == 1
+        assert result[0]["overlap_area"] == 2400
+
+    def test_element_ids_in_result(self):
+        """Result records contain correct element_a_id and element_b_id."""
+        a = self._elem("alpha", 0, 0, 100, 100)
+        b = self._elem("beta", 50, 50, 100, 100)
+        result = detect_element_overlaps([a, b])
+        assert len(result) == 1
+        assert result[0]["element_a_id"] == "alpha"
+        assert result[0]["element_b_id"] == "beta"
+
+
+# ── assign_z_indices ──────────────────────────────────────────────────────────
+
+class TestAssignZIndices:
+    """Tests for assign_z_indices()."""
+
+    @staticmethod
+    def _layer(z_order: int, depth: int, layer_id: str = "") -> dict:
+        return {"layer_id": layer_id or f"l{z_order}_{depth}", "z_order": z_order, "depth": depth}
+
+    def test_empty_list_returns_empty(self):
+        """Empty input returns []."""
+        assert assign_z_indices([]) == []
+
+    def test_z_index_field_added(self):
+        """Each layer gets a z_index field."""
+        layers = [self._layer(0, 0), self._layer(1, 1)]
+        result = assign_z_indices(layers)
+        for layer in result:
+            assert "z_index" in layer
+
+    def test_later_z_order_higher_z_index(self):
+        """Layer with higher z_order gets higher z_index (same depth)."""
+        layers = [self._layer(0, 0, "a"), self._layer(1, 0, "b")]
+        result = assign_z_indices(layers)
+        z_by_id = {r["layer_id"]: r["z_index"] for r in result}
+        assert z_by_id["b"] > z_by_id["a"]
+
+    def test_deeper_depth_higher_z_index(self):
+        """Same z_order, deeper depth → higher z_index."""
+        layers = [self._layer(0, 0, "parent"), self._layer(0, 1, "child")]
+        result = assign_z_indices(layers)
+        z_by_id = {r["layer_id"]: r["z_index"] for r in result}
+        assert z_by_id["child"] > z_by_id["parent"]
+
+    def test_does_not_mutate_input(self):
+        """Original list is not mutated."""
+        layers = [self._layer(0, 0, "a"), self._layer(1, 1, "b")]
+        originals = [dict(l) for l in layers]
+        assign_z_indices(layers)
+        for original, layer in zip(originals, layers):
+            assert "z_index" not in layer
+            assert layer == original
+
+    def test_z_index_non_negative(self):
+        """All z_index values are >= 0."""
+        layers = [self._layer(i, i % 3) for i in range(5)]
+        result = assign_z_indices(layers)
+        for r in result:
+            assert r["z_index"] >= 0
+
+    def test_single_layer(self):
+        """Single layer gets z_index of 0."""
+        result = assign_z_indices([self._layer(0, 0, "only")])
+        assert result[0]["z_index"] == 0
+
+    def test_children_higher_than_parent(self):
+        """A child (higher depth) has higher z_index than its parent (same z_order group)."""
+        # Simulate a parent at z_order=2, depth=0 and child at z_order=3, depth=1
+        layers = [
+            self._layer(2, 0, "parent"),
+            self._layer(3, 1, "child"),
+        ]
+        result = assign_z_indices(layers)
+        z_by_id = {r["layer_id"]: r["z_index"] for r in result}
+        assert z_by_id["child"] > z_by_id["parent"]
+
+
+# ── analyze_visual_stack ──────────────────────────────────────────────────────
+
+class TestAnalyzeVisualStack:
+    """Tests for analyze_visual_stack()."""
+
+    @staticmethod
+    def _elem(layer_id: str, x: int, y: int, w: int, h: int) -> dict:
+        return {"layer_id": layer_id, "x": x, "y": y, "width": w, "height": h}
+
+    def test_empty_list_returns_empty(self):
+        """Empty input returns []."""
+        assert analyze_visual_stack([]) == []
+
+    def test_overlaps_with_field_added(self):
+        """Each element gets overlaps_with list."""
+        elements = [self._elem("a", 0, 0, 50, 50), self._elem("b", 100, 100, 50, 50)]
+        result = analyze_visual_stack(elements)
+        for elem in result:
+            assert "overlaps_with" in elem
+            assert isinstance(elem["overlaps_with"], list)
+
+    def test_overlap_count_field_added(self):
+        """Each element gets overlap_count int."""
+        elements = [self._elem("a", 0, 0, 50, 50), self._elem("b", 100, 100, 50, 50)]
+        result = analyze_visual_stack(elements)
+        for elem in result:
+            assert "overlap_count" in elem
+            assert isinstance(elem["overlap_count"], int)
+
+    def test_non_overlapping_elements_zero_count(self):
+        """Non-overlapping elements have overlap_count == 0."""
+        elements = [self._elem("a", 0, 0, 50, 50), self._elem("b", 100, 100, 50, 50)]
+        result = analyze_visual_stack(elements)
+        for elem in result:
+            assert elem["overlap_count"] == 0
+            assert elem["overlaps_with"] == []
+
+    def test_overlapping_elements_count(self):
+        """Overlapping elements have correct overlap_count."""
+        a = self._elem("a", 0, 0, 100, 100)
+        b = self._elem("b", 50, 50, 100, 100)
+        result = analyze_visual_stack([a, b])
+        counts = {e["layer_id"]: e["overlap_count"] for e in result}
+        assert counts["a"] == 1
+        assert counts["b"] == 1
+
+    def test_overlap_is_symmetric(self):
+        """If A overlaps B, then B's overlaps_with contains A."""
+        a = self._elem("a", 0, 0, 100, 100)
+        b = self._elem("b", 50, 50, 100, 100)
+        result = analyze_visual_stack([a, b])
+        by_id = {e["layer_id"]: e for e in result}
+        assert "b" in by_id["a"]["overlaps_with"]
+        assert "a" in by_id["b"]["overlaps_with"]
+
+    def test_does_not_mutate_input(self):
+        """Original element dicts are not mutated."""
+        a = self._elem("a", 0, 0, 100, 100)
+        b = self._elem("b", 50, 50, 100, 100)
+        originals = [dict(a), dict(b)]
+        analyze_visual_stack([a, b])
+        assert a == originals[0]
+        assert b == originals[1]
+
+    def test_overlaps_with_is_sorted(self):
+        """overlaps_with list is sorted (deterministic)."""
+        a = self._elem("a", 0, 0, 200, 200)
+        b = self._elem("b", 10, 10, 50, 50)
+        c = self._elem("c", 20, 20, 50, 50)
+        result = analyze_visual_stack([a, b, c])
+        by_id = {e["layer_id"]: e for e in result}
+        overlaps_a = by_id["a"]["overlaps_with"]
+        assert overlaps_a == sorted(overlaps_a)
+
+    def test_single_element_no_overlaps(self):
+        """Single element has empty overlaps_with and overlap_count == 0."""
+        result = analyze_visual_stack([self._elem("only", 0, 0, 100, 100)])
+        assert result[0]["overlaps_with"] == []
+        assert result[0]["overlap_count"] == 0
