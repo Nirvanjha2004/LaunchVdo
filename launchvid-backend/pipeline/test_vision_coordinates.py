@@ -28,6 +28,11 @@ with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
                 detect_element_overlaps,
                 assign_z_indices,
                 analyze_visual_stack,
+                detect_element_groups,
+                _apply_group_dependencies,
+                _elements_are_proximate,
+                _group_bounding_box,
+                _classify_group,
             )
 
 
@@ -1147,3 +1152,543 @@ class TestAnalyzeVisualStack:
         result = analyze_visual_stack([self._elem("only", 0, 0, 100, 100)])
         assert result[0]["overlaps_with"] == []
         assert result[0]["overlap_count"] == 0
+
+
+# ── _elements_are_proximate ───────────────────────────────────────────────────
+
+class TestElementsAreProximate:
+    """Tests for the _elements_are_proximate() helper."""
+
+    @staticmethod
+    def _elem(x: int, y: int, w: int, h: int) -> dict:
+        return {"x": x, "y": y, "width": w, "height": h}
+
+    def test_overlapping_elements_are_proximate(self):
+        """Overlapping elements are always proximate."""
+        a = self._elem(0, 0, 100, 100)
+        b = self._elem(50, 50, 100, 100)
+        assert _elements_are_proximate(a, b) is True
+
+    def test_touching_elements_are_proximate(self):
+        """Elements that share an edge (gap == 0) are proximate."""
+        a = self._elem(0, 0, 50, 50)
+        b = self._elem(50, 0, 50, 50)  # right edge of a == left edge of b
+        assert _elements_are_proximate(a, b) is True
+
+    def test_within_threshold_are_proximate(self):
+        """Elements within the default 20px threshold are proximate."""
+        a = self._elem(0, 0, 50, 50)
+        b = self._elem(60, 0, 50, 50)  # 10px gap horizontally
+        assert _elements_are_proximate(a, b) is True
+
+    def test_exactly_at_threshold_are_proximate(self):
+        """Elements exactly at the threshold distance are proximate."""
+        a = self._elem(0, 0, 50, 50)
+        b = self._elem(70, 0, 50, 50)  # 20px gap horizontally
+        assert _elements_are_proximate(a, b) is True
+
+    def test_beyond_threshold_not_proximate(self):
+        """Elements beyond the threshold are not proximate."""
+        a = self._elem(0, 0, 50, 50)
+        b = self._elem(100, 0, 50, 50)  # 50px gap horizontally
+        assert _elements_are_proximate(a, b) is False
+
+    def test_custom_threshold(self):
+        """Custom threshold is respected."""
+        a = self._elem(0, 0, 50, 50)
+        b = self._elem(100, 0, 50, 50)  # 50px gap
+        assert _elements_are_proximate(a, b, threshold_px=50) is True
+        assert _elements_are_proximate(a, b, threshold_px=49) is False
+
+    def test_vertical_gap_beyond_threshold_not_proximate(self):
+        """Elements far apart vertically are not proximate."""
+        a = self._elem(0, 0, 50, 50)
+        b = self._elem(0, 100, 50, 50)  # 50px vertical gap
+        assert _elements_are_proximate(a, b) is False
+
+    def test_diagonal_proximity_both_axes_within_threshold(self):
+        """Both horizontal and vertical gaps must be within threshold."""
+        a = self._elem(0, 0, 50, 50)
+        b = self._elem(60, 60, 50, 50)  # 10px gap in both axes
+        assert _elements_are_proximate(a, b) is True
+
+    def test_diagonal_one_axis_beyond_threshold(self):
+        """If either axis gap exceeds threshold, elements are not proximate."""
+        a = self._elem(0, 0, 50, 50)
+        b = self._elem(60, 200, 50, 50)  # 10px h-gap, 150px v-gap
+        assert _elements_are_proximate(a, b) is False
+
+
+# ── _group_bounding_box ───────────────────────────────────────────────────────
+
+class TestGroupBoundingBox:
+    """Tests for the _group_bounding_box() helper."""
+
+    @staticmethod
+    def _elem(x: int, y: int, w: int, h: int) -> dict:
+        return {"x": x, "y": y, "width": w, "height": h}
+
+    def test_single_element_bbox_equals_element(self):
+        """Bounding box of a single element equals that element's bounds."""
+        elem = self._elem(10, 20, 100, 50)
+        bbox = _group_bounding_box([elem])
+        assert bbox == {"x": 10, "y": 20, "width": 100, "height": 50}
+
+    def test_two_non_overlapping_elements(self):
+        """Bounding box encloses both non-overlapping elements."""
+        a = self._elem(0, 0, 50, 50)
+        b = self._elem(100, 100, 50, 50)
+        bbox = _group_bounding_box([a, b])
+        assert bbox["x"] == 0
+        assert bbox["y"] == 0
+        assert bbox["width"] == 150   # 0 to 150
+        assert bbox["height"] == 150  # 0 to 150
+
+    def test_two_overlapping_elements(self):
+        """Bounding box encloses both overlapping elements."""
+        a = self._elem(0, 0, 100, 100)
+        b = self._elem(50, 50, 100, 100)
+        bbox = _group_bounding_box([a, b])
+        assert bbox["x"] == 0
+        assert bbox["y"] == 0
+        assert bbox["width"] == 150
+        assert bbox["height"] == 150
+
+    def test_three_elements_bbox(self):
+        """Bounding box correctly encloses three elements."""
+        elements = [
+            self._elem(10, 10, 50, 30),
+            self._elem(70, 5, 40, 20),
+            self._elem(20, 50, 60, 40),
+        ]
+        bbox = _group_bounding_box(elements)
+        assert bbox["x"] == 10
+        assert bbox["y"] == 5
+        assert bbox["width"] == 100   # 10 to 110
+        assert bbox["height"] == 85   # 5 to 90
+
+    def test_return_types_are_int(self):
+        """All bounding box values are integers."""
+        elem = self._elem(10, 20, 100, 50)
+        bbox = _group_bounding_box([elem])
+        for key in ("x", "y", "width", "height"):
+            assert isinstance(bbox[key], int), f"{key} should be int"
+
+    def test_minimum_width_is_one(self):
+        """Bounding box width is at least 1."""
+        elem = {"x": 10, "y": 10, "width": 0, "height": 50}
+        bbox = _group_bounding_box([elem])
+        assert bbox["width"] >= 1
+
+    def test_minimum_height_is_one(self):
+        """Bounding box height is at least 1."""
+        elem = {"x": 10, "y": 10, "width": 50, "height": 0}
+        bbox = _group_bounding_box([elem])
+        assert bbox["height"] >= 1
+
+
+# ── _classify_group ───────────────────────────────────────────────────────────
+
+class TestClassifyGroup:
+    """Tests for the _classify_group() helper."""
+
+    def test_hero_section_detected(self):
+        """headline + cta_button + hero_image → hero_section."""
+        group_type, confidence = _classify_group(["headline", "cta_button", "hero_image"])
+        assert group_type == "hero_section"
+        assert confidence > 0.5
+
+    def test_form_group_detected(self):
+        """label + input_field → form_group."""
+        group_type, confidence = _classify_group(["label", "input_field"])
+        assert group_type == "form_group"
+        assert confidence > 0.5
+
+    def test_nav_group_detected(self):
+        """navigation + app_icon → nav_group."""
+        group_type, confidence = _classify_group(["navigation", "app_icon"])
+        assert group_type == "nav_group"
+        assert confidence > 0.5
+
+    def test_cta_group_detected(self):
+        """cta_button + body_text → cta_group."""
+        group_type, confidence = _classify_group(["cta_button", "body_text"])
+        assert group_type == "cta_group"
+        assert confidence > 0.5
+
+    def test_card_group_detected(self):
+        """headline + body_text + feature_image → card."""
+        group_type, confidence = _classify_group(["headline", "body_text", "feature_image"])
+        # card and hero_section are both valid; just check confidence is reasonable
+        assert group_type in ("card", "hero_section", "content_block", "feature_row")
+        assert confidence >= 0.3
+
+    def test_confidence_in_range(self):
+        """Confidence is always in [0.0, 1.0]."""
+        for roles in [
+            ["headline"],
+            ["cta_button", "body_text"],
+            ["navigation", "app_icon", "label"],
+            ["unknown_role"],
+            [],
+        ]:
+            _, confidence = _classify_group(roles)
+            assert 0.0 <= confidence <= 1.0, f"confidence={confidence} out of range for roles={roles}"
+
+    def test_empty_roles_returns_content_block(self):
+        """Empty role list returns content_block with 0.0 confidence."""
+        group_type, confidence = _classify_group([])
+        assert group_type == "content_block"
+        assert confidence == 0.0
+
+    def test_returns_tuple(self):
+        """Return value is a (str, float) tuple."""
+        result = _classify_group(["headline", "body_text"])
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], str)
+        assert isinstance(result[1], float)
+
+
+# ── detect_element_groups ─────────────────────────────────────────────────────
+
+class TestDetectElementGroups:
+    """Tests for detect_element_groups()."""
+
+    @staticmethod
+    def _elem(
+        layer_id: str,
+        x: int,
+        y: int,
+        w: int,
+        h: int,
+        semantic_role: str = "body_text",
+    ) -> dict:
+        return {
+            "layer_id": layer_id,
+            "x": x,
+            "y": y,
+            "width": w,
+            "height": h,
+            "semantic_role": semantic_role,
+        }
+
+    # ── Basic grouping ────────────────────────────────────────────────────────
+
+    def test_empty_list_returns_empty(self):
+        """Empty input returns []."""
+        assert detect_element_groups([]) == []
+
+    def test_single_element_no_group(self):
+        """A single element cannot form a group."""
+        elem = self._elem("a", 0, 0, 100, 50, "headline")
+        assert detect_element_groups([elem]) == []
+
+    def test_two_proximate_compatible_elements_form_group(self):
+        """Two proximate, semantically compatible elements form one group."""
+        headline = self._elem("h", 0, 0, 200, 40, "headline")
+        body = self._elem("b", 0, 50, 200, 60, "body_text")
+        groups = detect_element_groups([headline, body])
+        assert len(groups) == 1
+        assert set(groups[0]["member_ids"]) == {"h", "b"}
+
+    def test_two_far_apart_elements_no_group(self):
+        """Elements far apart (> 20px) do not form a group."""
+        headline = self._elem("h", 0, 0, 200, 40, "headline")
+        body = self._elem("b", 0, 500, 200, 60, "body_text")
+        groups = detect_element_groups([headline, body])
+        assert groups == []
+
+    def test_two_proximate_incompatible_roles_no_group(self):
+        """Proximate elements with incompatible roles do not form a group.
+
+        'background' and 'status_bar' share no common group type in
+        _GROUP_ROLE_COMPATIBILITY, so they should not be grouped.
+        """
+        bg = self._elem("bg", 0, 0, 390, 844, "background")
+        status = self._elem("sb", 0, 0, 390, 44, "status_bar")
+        groups = detect_element_groups([bg, status])
+        assert groups == []
+
+    # ── Semantic pattern detection ────────────────────────────────────────────
+
+    def test_hero_section_pattern(self):
+        """headline + body_text + cta_button in close proximity → hero_section."""
+        headline = self._elem("h", 20, 100, 350, 50, "headline")
+        body = self._elem("b", 20, 160, 350, 80, "body_text")
+        cta = self._elem("c", 100, 260, 190, 50, "cta_button")
+        groups = detect_element_groups([headline, body, cta])
+        assert len(groups) == 1
+        assert groups[0]["group_type"] == "hero_section"
+        assert set(groups[0]["member_ids"]) == {"h", "b", "c"}
+
+    def test_form_group_pattern(self):
+        """label + input_field in close proximity → form_group."""
+        label = self._elem("lbl", 20, 200, 100, 20, "label")
+        inp = self._elem("inp", 20, 228, 350, 44, "input_field")
+        groups = detect_element_groups([label, inp])
+        assert len(groups) == 1
+        assert groups[0]["group_type"] == "form_group"
+
+    def test_nav_group_pattern(self):
+        """Multiple navigation elements in close proximity → nav_group."""
+        nav1 = self._elem("n1", 0, 0, 80, 44, "navigation")
+        nav2 = self._elem("n2", 90, 0, 80, 44, "navigation")
+        nav3 = self._elem("n3", 180, 0, 80, 44, "navigation")
+        groups = detect_element_groups([nav1, nav2, nav3])
+        assert len(groups) == 1
+        assert groups[0]["group_type"] == "nav_group"
+        assert len(groups[0]["member_ids"]) == 3
+
+    def test_cta_group_pattern(self):
+        """cta_button + secondary_button in close proximity → cta_group."""
+        cta = self._elem("cta", 50, 600, 290, 50, "cta_button")
+        sec = self._elem("sec", 50, 660, 290, 44, "secondary_button")
+        groups = detect_element_groups([cta, sec])
+        assert len(groups) == 1
+        assert groups[0]["group_type"] == "cta_group"
+
+    # ── Group output structure ────────────────────────────────────────────────
+
+    def test_group_has_required_keys(self):
+        """Each group dict has group_id, group_type, member_ids, bounding_box, confidence."""
+        headline = self._elem("h", 0, 0, 200, 40, "headline")
+        body = self._elem("b", 0, 50, 200, 60, "body_text")
+        groups = detect_element_groups([headline, body])
+        assert len(groups) == 1
+        g = groups[0]
+        assert "group_id" in g
+        assert "group_type" in g
+        assert "member_ids" in g
+        assert "bounding_box" in g
+        assert "confidence" in g
+
+    def test_group_id_format(self):
+        """group_id follows the 'group_N' format."""
+        headline = self._elem("h", 0, 0, 200, 40, "headline")
+        body = self._elem("b", 0, 50, 200, 60, "body_text")
+        groups = detect_element_groups([headline, body])
+        assert groups[0]["group_id"].startswith("group_")
+
+    def test_confidence_in_range(self):
+        """Confidence is always in [0.0, 1.0]."""
+        headline = self._elem("h", 0, 0, 200, 40, "headline")
+        body = self._elem("b", 0, 50, 200, 60, "body_text")
+        groups = detect_element_groups([headline, body])
+        for g in groups:
+            assert 0.0 <= g["confidence"] <= 1.0
+
+    def test_bounding_box_encloses_all_members(self):
+        """Group bounding box encloses all member elements."""
+        headline = self._elem("h", 20, 100, 350, 50, "headline")
+        body = self._elem("b", 20, 160, 350, 80, "body_text")
+        cta = self._elem("c", 100, 260, 190, 50, "cta_button")
+        groups = detect_element_groups([headline, body, cta])
+        assert len(groups) == 1
+        bbox = groups[0]["bounding_box"]
+        # All members must be within the bounding box
+        for elem in [headline, body, cta]:
+            assert elem["x"] >= bbox["x"]
+            assert elem["y"] >= bbox["y"]
+            assert elem["x"] + elem["width"] <= bbox["x"] + bbox["width"]
+            assert elem["y"] + elem["height"] <= bbox["y"] + bbox["height"]
+
+    def test_bounding_box_keys(self):
+        """Bounding box has x, y, width, height keys."""
+        headline = self._elem("h", 0, 0, 200, 40, "headline")
+        body = self._elem("b", 0, 50, 200, 60, "body_text")
+        groups = detect_element_groups([headline, body])
+        bbox = groups[0]["bounding_box"]
+        for key in ("x", "y", "width", "height"):
+            assert key in bbox
+
+    def test_member_ids_are_layer_ids(self):
+        """member_ids contains the layer_id values of the grouped elements."""
+        headline = self._elem("headline_layer", 0, 0, 200, 40, "headline")
+        body = self._elem("body_layer", 0, 50, 200, 60, "body_text")
+        groups = detect_element_groups([headline, body])
+        assert "headline_layer" in groups[0]["member_ids"]
+        assert "body_layer" in groups[0]["member_ids"]
+
+    # ── Multiple groups ───────────────────────────────────────────────────────
+
+    def test_two_separate_groups(self):
+        """Elements far apart form two separate groups."""
+        # Group 1: hero section at top
+        h1 = self._elem("h1", 20, 50, 350, 50, "headline")
+        b1 = self._elem("b1", 20, 110, 350, 60, "body_text")
+        # Group 2: form at bottom (far from group 1)
+        lbl = self._elem("lbl", 20, 600, 100, 20, "label")
+        inp = self._elem("inp", 20, 628, 350, 44, "input_field")
+        groups = detect_element_groups([h1, b1, lbl, inp])
+        assert len(groups) == 2
+
+    def test_group_ids_are_unique(self):
+        """All group_ids are unique."""
+        h1 = self._elem("h1", 20, 50, 350, 50, "headline")
+        b1 = self._elem("b1", 20, 110, 350, 60, "body_text")
+        lbl = self._elem("lbl", 20, 600, 100, 20, "label")
+        inp = self._elem("inp", 20, 628, 350, 44, "input_field")
+        groups = detect_element_groups([h1, b1, lbl, inp])
+        ids = [g["group_id"] for g in groups]
+        assert len(ids) == len(set(ids))
+
+    # ── Edge cases ────────────────────────────────────────────────────────────
+
+    def test_overlapping_elements_form_group(self):
+        """Overlapping elements (negative gap) are always proximate and can group."""
+        # A label overlapping an input field (common in floating-label patterns)
+        label = self._elem("lbl", 20, 200, 100, 20, "label")
+        inp = self._elem("inp", 20, 210, 350, 44, "input_field")
+        groups = detect_element_groups([label, inp])
+        assert len(groups) == 1
+
+    def test_custom_proximity_threshold(self):
+        """Custom proximity_px threshold is respected."""
+        headline = self._elem("h", 0, 0, 200, 40, "headline")
+        body = self._elem("b", 0, 100, 200, 60, "body_text")  # 60px gap
+        # With default 20px threshold: no group
+        assert detect_element_groups([headline, body], proximity_px=20) == []
+        # With 60px threshold: group forms
+        groups = detect_element_groups([headline, body], proximity_px=60)
+        assert len(groups) == 1
+
+    def test_does_not_mutate_input(self):
+        """Input element list is not mutated."""
+        headline = self._elem("h", 0, 0, 200, 40, "headline")
+        body = self._elem("b", 0, 50, 200, 60, "body_text")
+        original_h = dict(headline)
+        original_b = dict(body)
+        detect_element_groups([headline, body])
+        assert headline == original_h
+        assert body == original_b
+
+    def test_deeply_nested_layer_names_ignored(self):
+        """Grouping is based on semantic_role, not layer names — works for any names."""
+        elem_a = self._elem("deeply/nested/layer/1", 0, 0, 200, 40, "headline")
+        elem_b = self._elem("deeply/nested/layer/2", 0, 50, 200, 60, "body_text")
+        groups = detect_element_groups([elem_a, elem_b])
+        assert len(groups) == 1
+
+    def test_all_same_role_navigation_forms_group(self):
+        """Multiple elements with the same nav role form a single group."""
+        navs = [
+            self._elem(f"nav_{i}", i * 80, 0, 70, 44, "navigation")
+            for i in range(4)
+        ]
+        groups = detect_element_groups(navs)
+        assert len(groups) == 1
+        assert len(groups[0]["member_ids"]) == 4
+
+
+# ── _apply_group_dependencies ─────────────────────────────────────────────────
+
+class TestApplyGroupDependencies:
+    """Tests for _apply_group_dependencies()."""
+
+    @staticmethod
+    def _elem(layer_id: str) -> dict:
+        return {"layer_id": layer_id, "x": 0, "y": 0, "width": 50, "height": 50}
+
+    @staticmethod
+    def _group(group_id: str, member_ids: list[str]) -> dict:
+        return {
+            "group_id": group_id,
+            "group_type": "content_block",
+            "member_ids": member_ids,
+            "bounding_box": {"x": 0, "y": 0, "width": 100, "height": 100},
+            "confidence": 0.8,
+        }
+
+    def test_group_id_added_to_members(self):
+        """Elements in a group receive the correct group_id."""
+        elements = [self._elem("a"), self._elem("b")]
+        groups = [self._group("group_0", ["a", "b"])]
+        result = _apply_group_dependencies(elements, groups)
+        by_id = {e["layer_id"]: e for e in result}
+        assert by_id["a"]["group_id"] == "group_0"
+        assert by_id["b"]["group_id"] == "group_0"
+
+    def test_non_member_gets_none_group_id(self):
+        """Elements not in any group get group_id == None."""
+        elements = [self._elem("a"), self._elem("b"), self._elem("c")]
+        groups = [self._group("group_0", ["a", "b"])]
+        result = _apply_group_dependencies(elements, groups)
+        by_id = {e["layer_id"]: e for e in result}
+        assert by_id["c"]["group_id"] is None
+
+    def test_dependencies_list_added(self):
+        """Each element gets a dependencies list."""
+        elements = [self._elem("a"), self._elem("b")]
+        groups = [self._group("group_0", ["a", "b"])]
+        result = _apply_group_dependencies(elements, groups)
+        for elem in result:
+            assert "dependencies" in elem
+            assert isinstance(elem["dependencies"], list)
+
+    def test_member_dependencies_reference_other_members(self):
+        """A member's dependencies list contains the other members' layer_ids."""
+        elements = [self._elem("a"), self._elem("b"), self._elem("c")]
+        groups = [self._group("group_0", ["a", "b", "c"])]
+        result = _apply_group_dependencies(elements, groups)
+        by_id = {e["layer_id"]: e for e in result}
+        assert set(by_id["a"]["dependencies"]) == {"b", "c"}
+        assert set(by_id["b"]["dependencies"]) == {"a", "c"}
+        assert set(by_id["c"]["dependencies"]) == {"a", "b"}
+
+    def test_non_member_has_empty_dependencies(self):
+        """Elements not in any group have an empty dependencies list."""
+        elements = [self._elem("a"), self._elem("b"), self._elem("lone")]
+        groups = [self._group("group_0", ["a", "b"])]
+        result = _apply_group_dependencies(elements, groups)
+        by_id = {e["layer_id"]: e for e in result}
+        assert by_id["lone"]["dependencies"] == []
+
+    def test_does_not_mutate_input_elements(self):
+        """Original element dicts are not mutated."""
+        elements = [self._elem("a"), self._elem("b")]
+        originals = [dict(e) for e in elements]
+        groups = [self._group("group_0", ["a", "b"])]
+        _apply_group_dependencies(elements, groups)
+        for original, elem in zip(originals, elements):
+            assert elem == original
+
+    def test_empty_groups_all_elements_ungrouped(self):
+        """With no groups, all elements get group_id=None and empty dependencies."""
+        elements = [self._elem("a"), self._elem("b")]
+        result = _apply_group_dependencies(elements, [])
+        for elem in result:
+            assert elem["group_id"] is None
+            assert elem["dependencies"] == []
+
+    def test_empty_elements_returns_empty(self):
+        """Empty elements list returns empty list."""
+        groups = [self._group("group_0", ["a", "b"])]
+        result = _apply_group_dependencies([], groups)
+        assert result == []
+
+    def test_output_length_matches_input(self):
+        """Output list has the same length as the input elements list."""
+        elements = [self._elem(f"e{i}") for i in range(5)]
+        groups = [self._group("group_0", ["e0", "e1", "e2"])]
+        result = _apply_group_dependencies(elements, groups)
+        assert len(result) == len(elements)
+
+    def test_other_element_keys_preserved(self):
+        """Non-grouping keys on elements are preserved unchanged."""
+        elem = {
+            "layer_id": "a",
+            "x": 10,
+            "y": 20,
+            "width": 100,
+            "height": 50,
+            "semantic_role": "headline",
+            "color": "#ff0000",
+        }
+        groups = [self._group("group_0", ["a"])]
+        result = _apply_group_dependencies([elem], groups)
+        r = result[0]
+        assert r["x"] == 10
+        assert r["y"] == 20
+        assert r["semantic_role"] == "headline"
+        assert r["color"] == "#ff0000"

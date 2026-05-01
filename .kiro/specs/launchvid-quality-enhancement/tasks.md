@@ -1,5 +1,12 @@
 # Tasks: LaunchVid Quality Enhancement
 
+## Environment Setup
+
+> **All Python commands must be run using the project venv.**
+> - Activate: `source launchvid-backend/venv/bin/activate` (Linux/macOS) or `launchvid-backend/venv/Scripts/activate` (Windows)
+> - Or prefix commands: `launchvid-backend/venv/Scripts/python` / `launchvid-backend/venv/Scripts/pytest`
+> - Install dependencies: `launchvid-backend/venv/Scripts/pip install -r launchvid-backend/requirements.txt`
+
 ## Epic 1: Enhanced Vision Analysis System
 
 ### 1.1 Precision Element Extraction
@@ -8,7 +15,7 @@
 - [x] 1.1.3 Add layer tree traversal with depth-first element collection
 - [x] 1.1.4 Create element bounds calculation with proper scaling
 - [x] 1.1.5 Implement element overlap detection and z-index analysis
-- [ ] 1.1.6 Add element grouping detection for related UI components
+- [x] 1.1.6 Add element grouping detection for related UI components
 - [ ] 1.1.7 Create unit tests for element extraction accuracy
 
 ### 1.2 Semantic Role Identification

@@ -799,6 +799,12 @@ async def analyze_frame(frame: dict) -> dict:
                 # Enrich with pairwise overlap data
                 result["elements"] = analyze_visual_stack(result["elements"])
 
+            # Task 1.1.6: Detect element groups and enrich elements with group membership
+            if "elements" in result:
+                groups = detect_element_groups(result["elements"])
+                result["element_groups"] = groups
+                result["elements"] = _apply_group_dependencies(result["elements"], groups)
+
             # FIX 4 applied: Apply semantic rules to animation sequence
             if "animation_sequence" in result:
                 result["animation_sequence"] = apply_semantic_rules(result["animation_sequence"])
@@ -920,6 +926,10 @@ def _fallback_analysis(frame: dict) -> dict:
 
     elements = analyze_visual_stack(elements)
 
+    # Task 1.1.6: Detect element groups and enrich elements with group membership
+    groups = detect_element_groups(elements)
+    elements = _apply_group_dependencies(elements, groups)
+
     return {
         "frame_name":         frame.get("frameName", "Unknown"),
         "frame_id":           frame.get("frameId", ""),
@@ -931,6 +941,7 @@ def _fallback_analysis(frame: dict) -> dict:
         "bg_color":           "#ffffff",
         "elements":           elements,
         "animation_sequence": sequence,
+        "element_groups":     groups,
     }
 
 
@@ -1020,6 +1031,335 @@ def apply_semantic_rules(animation_sequence: list[dict]) -> list[dict]:
         anim.pop("__exported_image", None)
         anim.pop("__y", None)
         anim.pop("__height", None)
+
+    return result
+
+
+# ── Element Grouping Detection ────────────────────────────────────────────────
+
+# Semantic roles that are compatible with each group type.
+# Each entry maps a group_type to the set of semantic_role values that can
+# participate in that group.
+_GROUP_ROLE_COMPATIBILITY: dict[str, frozenset[str]] = {
+    "hero_section":  frozenset({"headline", "subheadline", "body_text", "cta_button", "hero_image"}),
+    "card":          frozenset({"headline", "subheadline", "body_text", "cta_button", "secondary_button",
+                                "feature_image", "card", "label", "decoration"}),
+    "form_group":    frozenset({"label", "input_field", "cta_button", "secondary_button", "body_text"}),
+    "nav_group":     frozenset({"navigation", "app_icon", "label", "decoration"}),
+    "feature_row":   frozenset({"headline", "subheadline", "body_text", "decoration", "feature_image",
+                                "hero_image", "label"}),
+    "cta_group":     frozenset({"cta_button", "secondary_button", "body_text", "label", "decoration"}),
+    "content_block": frozenset({"headline", "subheadline", "body_text", "label", "decoration",
+                                "feature_image", "card"}),
+}
+
+# Minimum number of members required to form a group.
+_MIN_GROUP_SIZE = 2
+
+# Spatial proximity threshold in pixels: elements within this distance of each
+# other (edge-to-edge) are considered spatially proximate.
+_PROXIMITY_PX = 20
+
+
+def _elements_are_proximate(a: dict, b: dict, threshold_px: int = _PROXIMITY_PX) -> bool:
+    """
+    Return True when two elements are spatially proximate or overlapping.
+
+    Two elements are proximate when the gap between their closest edges is
+    ≤ *threshold_px* pixels in both the horizontal and vertical axes.  An
+    overlap (negative gap) also satisfies this condition.
+
+    Args:
+        a, b:         Element dicts with ``x``, ``y``, ``width``, ``height``.
+        threshold_px: Maximum edge-to-edge gap (in pixels) to be considered
+                      proximate.  Defaults to ``_PROXIMITY_PX`` (20 px).
+
+    Returns:
+        bool
+    """
+    ax1, ay1 = a.get("x", 0), a.get("y", 0)
+    ax2 = ax1 + max(a.get("width", 0), 0)
+    ay2 = ay1 + max(a.get("height", 0), 0)
+
+    bx1, by1 = b.get("x", 0), b.get("y", 0)
+    bx2 = bx1 + max(b.get("width", 0), 0)
+    by2 = by1 + max(b.get("height", 0), 0)
+
+    # Horizontal gap: negative means overlap
+    h_gap = max(ax1, bx1) - min(ax2, bx2)
+    # Vertical gap: negative means overlap
+    v_gap = max(ay1, by1) - min(ay2, by2)
+
+    return h_gap <= threshold_px and v_gap <= threshold_px
+
+
+def _group_bounding_box(members: list[dict]) -> dict:
+    """
+    Compute the axis-aligned bounding box that encloses all *members*.
+
+    Args:
+        members: Non-empty list of element dicts with ``x``, ``y``,
+                 ``width``, ``height``.
+
+    Returns:
+        dict with ``x``, ``y``, ``width``, ``height`` (all ints).
+    """
+    min_x = min(m.get("x", 0) for m in members)
+    min_y = min(m.get("y", 0) for m in members)
+    max_x = max(m.get("x", 0) + max(m.get("width", 0), 0) for m in members)
+    max_y = max(m.get("y", 0) + max(m.get("height", 0), 0) for m in members)
+    return {
+        "x":      int(min_x),
+        "y":      int(min_y),
+        "width":  int(max(1, max_x - min_x)),
+        "height": int(max(1, max_y - min_y)),
+    }
+
+
+def _classify_group(member_roles: list[str]) -> tuple[str, float]:
+    """
+    Determine the best-matching group type and a confidence score for a set
+    of semantic roles.
+
+    The confidence score is the Jaccard-like ratio of matched roles to the
+    union of the candidate group's role set and the member roles:
+
+        confidence = |matched| / |member_roles|
+
+    where *matched* is the number of member roles that appear in the
+    candidate group's compatible-role set.
+
+    Ties in score are broken by a specificity ranking so that more specific
+    group types (e.g. ``cta_group``, ``form_group``) win over generic ones
+    (e.g. ``card``, ``hero_section``) when the scores are equal.
+
+    Args:
+        member_roles: List of ``semantic_role`` strings for the candidate
+                      group members.
+
+    Returns:
+        Tuple of (group_type: str, confidence: float).  Returns
+        ``("content_block", 0.0)`` as a safe fallback when no specific
+        pattern matches.
+    """
+    if not member_roles:
+        return ("content_block", 0.0)
+
+    role_set = set(member_roles)
+    best_type = "content_block"
+    best_score = 0.0
+
+    # Specificity priority: used as a tie-breaker only when a group's defining
+    # "key signal" role is present.  A group without its key signal role does
+    # not earn a specificity advantage.
+    # Higher number = higher priority when scores are equal AND key role present.
+    _SPECIFICITY: dict[str, int] = {
+        "form_group":    6,  # key signal: input_field
+        "nav_group":     5,  # key signal: navigation
+        "cta_group":     4,  # key signal: cta_button
+        "hero_section":  3,  # key signal: headline or hero_image
+        "card":          2,
+        "feature_row":   1,
+        "content_block": 0,  # fallback
+    }
+
+    # Mapping from group_type to its defining "key signal" roles.
+    _KEY_SIGNALS: dict[str, frozenset[str]] = {
+        "form_group":   frozenset({"input_field"}),
+        "nav_group":    frozenset({"navigation"}),
+        "cta_group":    frozenset({"cta_button"}),
+        "hero_section": frozenset({"headline", "hero_image"}),
+    }
+
+    for group_type, compatible_roles in _GROUP_ROLE_COMPATIBILITY.items():
+        matched = len(role_set & compatible_roles)
+        if matched == 0:
+            continue
+        # Score: fraction of member roles that are compatible with this group type
+        score = matched / len(role_set)
+        # Bonus for specific high-signal roles
+        if group_type == "hero_section" and (
+            "headline" in role_set or "hero_image" in role_set
+        ):
+            score = min(1.0, score + 0.2)
+        elif group_type == "form_group" and "input_field" in role_set:
+            score = min(1.0, score + 0.2)
+        elif group_type == "nav_group" and "navigation" in role_set:
+            score = min(1.0, score + 0.2)
+        elif group_type == "cta_group" and "cta_button" in role_set:
+            score = min(1.0, score + 0.15)
+
+        # Tie-breaking: prefer the more specific group type, but only when
+        # that group's key signal role is present in the member set.
+        has_key_signal = bool(role_set & _KEY_SIGNALS.get(group_type, frozenset()))
+        current_specificity = _SPECIFICITY.get(group_type, 0) if has_key_signal else 0
+        best_has_key = bool(role_set & _KEY_SIGNALS.get(best_type, frozenset()))
+        best_specificity = _SPECIFICITY.get(best_type, 0) if best_has_key else 0
+        if score > best_score or (score == best_score and current_specificity > best_specificity):
+            best_score = score
+            best_type = group_type
+
+    # Minimum confidence floor so callers can filter low-quality groups
+    if best_score < 0.3:
+        best_score = 0.3
+
+    return (best_type, round(best_score, 4))
+
+
+def detect_element_groups(
+    elements: list[dict],
+    proximity_px: int = _PROXIMITY_PX,
+) -> list[dict]:
+    """
+    Detect groups of related UI elements using spatial proximity and semantic
+    role compatibility.
+
+    The algorithm uses a union-find (disjoint-set) approach:
+
+    1. For every pair of elements, check whether they are spatially proximate
+       (edge-to-edge gap ≤ *proximity_px*) **and** share at least one
+       compatible group type (i.e. both roles appear in the same entry of
+       ``_GROUP_ROLE_COMPATIBILITY``).
+    2. Merge proximate, semantically compatible elements into the same group.
+    3. Discard groups with fewer than ``_MIN_GROUP_SIZE`` members.
+    4. For each surviving group, classify it, compute its bounding box, and
+       assign a confidence score.
+
+    Args:
+        elements:     List of element dicts.  Each dict must have at minimum:
+                      ``layer_id`` (str), ``x`` (int), ``y`` (int),
+                      ``width`` (int), ``height`` (int), and
+                      ``semantic_role`` (str).
+        proximity_px: Maximum edge-to-edge pixel gap for two elements to be
+                      considered spatially proximate.  Defaults to 20 px.
+
+    Returns:
+        List of group dicts, each containing:
+
+        - ``group_id``    (str)       – unique identifier, e.g. ``"group_0"``.
+        - ``group_type``  (str)       – detected pattern type (e.g.
+          ``"hero_section"``, ``"card"``, ``"form_group"``).
+        - ``member_ids``  (list[str]) – ``layer_id`` values of member elements,
+          in the order they appear in *elements*.
+        - ``bounding_box`` (dict)     – ``{x, y, width, height}`` enclosing all
+          members (integer pixels).
+        - ``confidence``  (float)     – score in [0.0, 1.0] reflecting how well
+          the members match the detected group type.
+    """
+    if not elements:
+        return []
+
+    n = len(elements)
+
+    # ── Union-Find helpers ────────────────────────────────────────────────────
+    parent = list(range(n))
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]  # path compression
+            i = parent[i]
+        return i
+
+    def _union(i: int, j: int) -> None:
+        ri, rj = _find(i), _find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    # ── Build a set of roles that each element participates in ────────────────
+    # Pre-compute which group types each element's role is compatible with.
+    def _compatible_group_types(role: str) -> frozenset[str]:
+        return frozenset(
+            gt for gt, roles in _GROUP_ROLE_COMPATIBILITY.items() if role in roles
+        )
+
+    elem_group_types = [
+        _compatible_group_types(elem.get("semantic_role", "")) for elem in elements
+    ]
+
+    # ── Pairwise proximity + semantic compatibility check ─────────────────────
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Skip if already in the same group
+            if _find(i) == _find(j):
+                continue
+
+            # Must share at least one compatible group type
+            shared_types = elem_group_types[i] & elem_group_types[j]
+            if not shared_types:
+                continue
+
+            # Must be spatially proximate
+            if _elements_are_proximate(elements[i], elements[j], proximity_px):
+                _union(i, j)
+
+    # ── Collect groups ────────────────────────────────────────────────────────
+    from collections import defaultdict
+    groups_map: dict[int, list[int]] = defaultdict(list)
+    for idx in range(n):
+        groups_map[_find(idx)].append(idx)
+
+    result: list[dict] = []
+    group_counter = 0
+
+    for root_idx, member_indices in sorted(groups_map.items()):
+        if len(member_indices) < _MIN_GROUP_SIZE:
+            continue
+
+        member_elements = [elements[i] for i in member_indices]
+        member_ids = [elem.get("layer_id", "") for elem in member_elements]
+        member_roles = [elem.get("semantic_role", "") for elem in member_elements]
+
+        group_type, confidence = _classify_group(member_roles)
+        bbox = _group_bounding_box(member_elements)
+
+        result.append({
+            "group_id":    f"group_{group_counter}",
+            "group_type":  group_type,
+            "member_ids":  member_ids,
+            "bounding_box": bbox,
+            "confidence":  confidence,
+        })
+        group_counter += 1
+
+    return result
+
+
+def _apply_group_dependencies(
+    elements: list[dict],
+    groups: list[dict],
+) -> list[dict]:
+    """
+    Enrich each element with a ``group_id`` and a ``dependencies`` list that
+    references the other members of its group.
+
+    Elements that do not belong to any group receive an empty ``dependencies``
+    list and ``group_id`` of ``None``.
+
+    Args:
+        elements: List of element dicts (each must have ``layer_id``).
+        groups:   List of group dicts as returned by ``detect_element_groups``.
+
+    Returns:
+        A new list of element dicts (shallow copies) with ``group_id`` and
+        ``dependencies`` fields added.  The input list is not mutated.
+    """
+    # Build a mapping: layer_id → (group_id, [other member layer_ids])
+    membership: dict[str, tuple[str, list[str]]] = {}
+    for group in groups:
+        gid = group["group_id"]
+        members = group["member_ids"]
+        for lid in members:
+            others = [m for m in members if m != lid]
+            membership[lid] = (gid, others)
+
+    result = []
+    for element in elements:
+        lid = element.get("layer_id", "")
+        if lid in membership:
+            gid, deps = membership[lid]
+            result.append({**element, "group_id": gid, "dependencies": deps})
+        else:
+            result.append({**element, "group_id": None, "dependencies": []})
 
     return result
 
